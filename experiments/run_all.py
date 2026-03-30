@@ -12,7 +12,6 @@ Policy configurations
 """
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -26,6 +25,7 @@ from sim.policies import (
     NoPrefetch,
     SessionAwarePrefetch,
 )
+from sim.router import Router, Worker
 from sim.storage import StorageTier
 from trace.generator import Request
 from trace.replay import TraceReplayer
@@ -56,43 +56,52 @@ def _build_tiers(hw_cfg: dict) -> List[StorageTier]:
     return tiers
 
 
-def _build_manager(
-    hw_cfg: dict,
-    pc: PolicyConfig,
-    future_access_map: Optional[dict] = None,
-    learned_model=None,
-) -> CacheManager:
-    tiers = _build_tiers(hw_cfg)
-
-    # Eviction
+def _build_eviction(pc: PolicyConfig, future_access_map=None, learned_model=None):
     if pc.eviction_type == "lru":
-        eviction = LRUPolicy()
+        return LRUPolicy()
     elif pc.eviction_type == "arc":
-        eviction = ARCPolicy()
+        return ARCPolicy()
     elif pc.eviction_type == "learned":
-        eviction = LearnedPolicy()
+        policy = LearnedPolicy()
         if learned_model is not None:
-            eviction.set_model(learned_model)
+            policy.set_model(learned_model)
+        return policy
     elif pc.eviction_type == "belady":
-        eviction = BeladyOracle(future_access_map or {})
+        return BeladyOracle(future_access_map or {})
     else:
         raise ValueError(f"Unknown eviction type: {pc.eviction_type}")
 
-    # Prefetch
+
+def _build_prefetch(pc: PolicyConfig):
     if pc.prefetch_type == "none":
-        prefetch = NoPrefetch()
+        return NoPrefetch()
     elif pc.prefetch_type == "session":
-        prefetch = SessionAwarePrefetch()
+        return SessionAwarePrefetch()
     else:
         raise ValueError(f"Unknown prefetch type: {pc.prefetch_type}")
 
-    return CacheManager(
-        tiers=tiers,
-        eviction_policy=eviction,
-        prefetch_policy=prefetch,
-        selective_write=pc.selective_write,
-        selective_write_depth=pc.selective_write_depth,
-    )
+
+def _build_workers(
+    hw_cfg: dict,
+    pc: PolicyConfig,
+    num_workers: int,
+    future_access_map=None,
+    learned_model=None,
+) -> List[Worker]:
+    workers = []
+    for wid in range(num_workers):
+        tiers = _build_tiers(hw_cfg)
+        eviction = _build_eviction(pc, future_access_map, learned_model)
+        prefetch = _build_prefetch(pc)
+        cm = CacheManager(
+            tiers=tiers,
+            eviction_policy=eviction,
+            prefetch_policy=prefetch,
+            selective_write=pc.selective_write,
+            selective_write_depth=pc.selective_write_depth,
+        )
+        workers.append(Worker(wid, cm))
+    return workers
 
 
 class ExperimentRunner:
@@ -109,6 +118,7 @@ class ExperimentRunner:
         self.config = config
         self.warmup = warmup
         self._hw_cfg = config.get("hardware", {})
+        self._num_workers = config.get("cache", {}).get("num_workers", 4)
 
     def run_all(
         self,
@@ -117,24 +127,20 @@ class ExperimentRunner:
     ) -> Dict[str, Metrics]:
         """
         Run every policy configuration against the same request list.
-
-        Returns
-        -------
-        dict mapping policy name → Metrics
+        Uses Router with multiple Workers for prefix-aware routing.
         """
-        # Pre-build Belady future map once (shared across oracle runs)
         future_map = _build_future_map(requests)
 
         results: Dict[str, Metrics] = {}
         for pc in self.CONFIGS:
             print(f"  Running [{pc.name}] …", end=" ", flush=True)
-            manager = _build_manager(
-                self._hw_cfg,
-                pc,
+            workers = _build_workers(
+                self._hw_cfg, pc, self._num_workers,
                 future_access_map=future_map,
                 learned_model=learned_model,
             )
-            replayer = TraceReplayer(manager, warmup_count=self.warmup)
+            router = Router(workers)
+            replayer = TraceReplayer(router, warmup_count=self.warmup)
             metrics = replayer.run(requests)
             results[pc.name] = metrics
             print(f"hit_rate={metrics.hit_rate:.2%}  evictions={metrics.evictions}")
@@ -148,9 +154,7 @@ class ExperimentRunner:
 
 
 def _build_future_map(requests: List[Request]) -> dict:
-    """
-    Build {block_hash: [sorted timestamps]} for BeladyOracle.
-    """
+    """Build {block_hash: [sorted timestamps]} for BeladyOracle."""
     from collections import defaultdict
     m: dict = defaultdict(list)
     for req in requests:

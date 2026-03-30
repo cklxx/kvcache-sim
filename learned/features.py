@@ -34,7 +34,9 @@ def extract_features(
     """
     Build the 8-dim feature vector for one block at *current_time*.
     """
-    hist = access_times.get(block_hash, [])
+    # Only use history up to current_time (build_feature_matrix passes the full
+    # accumulated history, so future accesses must be excluded)
+    hist = [t for t in access_times.get(block_hash, []) if t <= current_time]
     if not hist:
         return [0.0] * 8
 

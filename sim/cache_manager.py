@@ -140,12 +140,16 @@ class CacheManager:
             if victim is None:
                 break
             evicted = tier.remove(victim)
-            self.eviction.remove(victim)
+            # Do NOT remove from eviction policy — demoted blocks must remain
+            # tracked so they can be evicted from lower tiers later.
             if evicted is not None:
                 self.metrics.evictions += 1
                 # Demote to next tier if possible
                 if tier_idx + 1 < len(self.tiers):
                     self._demote(evicted, tier_idx + 1, current_time)
+                else:
+                    # Evicted from the coldest tier — now truly remove from policy
+                    self.eviction.remove(victim)
 
         if tier.insert(block):
             return tier.transfer_latency_ms(block.size_bytes, is_read=False)

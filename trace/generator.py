@@ -55,6 +55,10 @@ class TraceGenerator:
     prompt_tokens_min/max : range of *new* tokens added each turn
     qps                   : average requests per simulated second
     block_size_bytes      : bytes per KV block (default 4 KiB)
+    num_system_prompts    : number of shared system prompt templates
+                            (sessions sharing the same prompt share prefix blocks,
+                             creating the hot/cold working set separation needed
+                             to differentiate eviction policies)
     seed                  : random seed for reproducibility
     """
 
@@ -66,6 +70,7 @@ class TraceGenerator:
         prompt_tokens_max: int = 256,
         qps: float = 10.0,
         block_size_bytes: int = 4096,
+        num_system_prompts: int = 8,
         seed: int = 42,
     ) -> None:
         self.num_sessions = num_sessions
@@ -74,16 +79,22 @@ class TraceGenerator:
         self.prompt_tokens_max = prompt_tokens_max
         self.qps = qps
         self.block_size = block_size_bytes
+        self.num_system_prompts = num_system_prompts
         self.rng = random.Random(seed)
         # Tokens per block boundary (simulate a fixed block-token size)
         self._tokens_per_block = 32
+        # Pre-build shared system prompts (deterministic, based on prompt index)
+        sp_rng = random.Random(seed + 999)
+        self._system_prompts: List[List[int]] = [
+            [sp_rng.randint(0, 50000) for _ in range(128)]
+            for _ in range(num_system_prompts)
+        ]
 
     def _new_tokens(self, n: int) -> List[int]:
         return [self.rng.randint(0, 50000) for _ in range(n)]
 
     def _session_context_tokens(self, session_id: str, length: int) -> List[int]:
-        """Deterministic system-prompt tokens for a session."""
-        # Seed based on session_id so the same session always has the same context
+        """Deterministic per-session topic tokens (appended after shared system prompt)."""
         r = random.Random(session_id)
         return [r.randint(0, 50000) for _ in range(length)]
 
@@ -105,9 +116,13 @@ class TraceGenerator:
         for s_idx in range(self.num_sessions):
             session_id = f"session_{s_idx:04d}"
 
-            # Each session starts with a shared "system prompt" context
-            system_len = self.rng.randint(self.prompt_tokens_min, self.prompt_tokens_max // 2)
-            session_tokens = self._session_context_tokens(session_id, system_len)
+            # Pick a shared system prompt (many sessions share the same one → hot blocks)
+            sp_idx = s_idx % self.num_system_prompts
+            shared_prefix = list(self._system_prompts[sp_idx])
+
+            # Append session-specific context tokens
+            topic_len = self.rng.randint(self.prompt_tokens_min // 4, self.prompt_tokens_max // 4)
+            session_tokens = shared_prefix + self._session_context_tokens(session_id, topic_len)
 
             for turn_id in range(self.turns_per_session):
                 # Add new turn tokens
@@ -147,5 +162,6 @@ class TraceGenerator:
             prompt_tokens_max=tc.get("prompt_tokens_max", 256),
             qps=tc.get("qps", 10.0),
             block_size_bytes=cc.get("block_size_bytes", 4096),
+            num_system_prompts=tc.get("num_system_prompts", 8),
             seed=tc.get("seed", 42),
         )

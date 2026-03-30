@@ -15,7 +15,7 @@ Prefetch
 """
 from __future__ import annotations
 
-import time
+import bisect
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
@@ -143,9 +143,18 @@ class ARCPolicy(EvictionPolicy):
             self.B2[block_hash] = None
 
     def remove(self, block_hash: str) -> None:
+        """Called when a block is physically evicted from the cache tier.
+        Move it to the appropriate ghost list so ARC can adapt p on future hits."""
+        # Only move to ghost if it's currently in T1 or T2 (live entries).
+        # Ghost entries (B1/B2) are left intact so future accesses can trigger
+        # the p-adaptation logic in record_access.
         self._move_to_ghost(block_hash)
-        self.B1.pop(block_hash, None)
-        self.B2.pop(block_hash, None)
+        # Trim ghost lists to prevent unbounded growth
+        _MAX_GHOST = 20_000
+        while len(self.B1) > _MAX_GHOST:
+            self.B1.popitem(last=False)
+        while len(self.B2) > _MAX_GHOST:
+            self.B2.popitem(last=False)
 
     def name(self) -> str:
         return "ARC"
@@ -166,11 +175,13 @@ class LearnedPolicy(EvictionPolicy):
         self._access_times: Dict[str, List[float]] = {}
         self._model = None
         self._lru = LRUPolicy()   # fallback + ordering
+        self._last_sim_time: float = 0.0
 
     def set_model(self, model) -> None:
         self._model = model
 
     def record_access(self, block_hash: str, current_time: float) -> None:
+        self._last_sim_time = current_time
         self._access_times.setdefault(block_hash, []).append(current_time)
         self._lru.record_access(block_hash, current_time)
 
@@ -193,8 +204,25 @@ class LearnedPolicy(EvictionPolicy):
     def evict_candidate(self, blocks: Dict) -> Optional[str]:
         if not blocks:
             return None
-        current_time = time.time()
-        return max(blocks, key=lambda h: self._predict_reuse_distance(h, current_time))
+        current_time = self._last_sim_time
+        # Sample at most 64 candidates to keep eviction O(1) in practice
+        import random as _random
+        keys = list(blocks.keys())
+        if len(keys) > 64:
+            keys = _random.sample(keys, 64)
+        # Batch predict for all sampled candidates
+        if self._model is not None and keys:
+            try:
+                from learned.features import extract_features
+                import numpy as np
+                import pandas as pd
+                feat_rows = [extract_features(h, self._access_times, current_time) for h in keys]
+                X = pd.DataFrame(feat_rows, columns=[f"f{i}" for i in range(len(feat_rows[0]))])
+                preds = self._model.predict(X)
+                return keys[int(np.argmax(preds))]
+            except Exception:
+                pass
+        return max(keys, key=lambda h: self._predict_reuse_distance(h, current_time))
 
     def remove(self, block_hash: str) -> None:
         self._access_times.pop(block_hash, None)
@@ -230,8 +258,10 @@ class BeladyOracle(EvictionPolicy):
 
     def _next_access(self, block_hash: str) -> float:
         accesses = self._future.get(block_hash, [])
-        future = [a for a in accesses if a > self._current_time]
-        return future[0] if future else float("inf")
+        if not accesses:
+            return float("inf")
+        idx = bisect.bisect_right(accesses, self._current_time)
+        return accesses[idx] if idx < len(accesses) else float("inf")
 
     def evict_candidate(self, blocks: Dict) -> Optional[str]:
         if not blocks:

@@ -82,6 +82,9 @@ class ModelTrainer:
 
         try:
             import lightgbm as lgb
+            import pandas as pd
+            feature_names = [f"f{i}" for i in range(X.shape[1])]
+            X_df = pd.DataFrame(X, columns=feature_names)
             params = {
                 "objective": "regression",
                 "metric": "rmse",
@@ -91,7 +94,7 @@ class ModelTrainer:
                 "verbosity": -1,
             }
             model = lgb.LGBMRegressor(**params)
-            model.fit(X, y)
+            model.fit(X_df, y)
             print("[train] LightGBM model trained.")
             return model
         except ImportError:

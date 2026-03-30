@@ -1,16 +1,16 @@
 hardware:
   hbm:
-    capacity_gb: 0.012     # ~12 MB  ≈ 3 000 blocks @ 4 KiB each
+    capacity_gb: 0.003     # 3 MB per worker — forces heavy eviction
     read_bw_gbps: 3200
     write_bw_gbps: 3200
     read_latency_ms: 0.001
   dram:
-    capacity_gb: 0.08      # ~80 MB  ≈ 20 000 blocks
+    capacity_gb: 0.008     # 8 MB per worker — moderate pressure
     read_bw_gbps: 200
     write_bw_gbps: 200
     read_latency_ms: 0.1
   ssd:
-    capacity_gb: 0.5       # ~500 MB ≈ enough for entire trace
+    capacity_gb: 0.1       # 100 MB per worker — cold storage
     read_bw_gbps: 7
     write_bw_gbps: 4
     read_latency_ms: 0.5
@@ -26,6 +26,7 @@ trace:
   turns_per_session: 6
   prompt_tokens_min: 64
   prompt_tokens_max: 512
+  num_system_prompts: 8
   qps: 20.0
   seed: 42
 
@@ -33,9 +34,9 @@ policies:
   eviction: lru          # lru | arc | learned
   prefetch: none         # none | session_aware
   selective_write: false
-  selective_write_depth_threshold: 3
+  selective_write_depth_threshold: 6
 
 experiments:
-  num_requests: 2000
+  num_requests: 1200
   warmup_requests: 200
   output_dir: results

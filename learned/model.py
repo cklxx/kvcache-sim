@@ -43,7 +43,13 @@ class LearnedModel:
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Raw batch prediction (returns log-distance array)."""
-        return self._model.predict(X)
+        try:
+            import pandas as pd
+            feature_names = [f"f{i}" for i in range(X.shape[1])]
+            X_df = pd.DataFrame(X, columns=feature_names)
+            return self._model.predict(X_df)
+        except Exception:
+            return self._model.predict(X)
 
     @classmethod
     def from_trainer(cls, trainer) -> Optional["LearnedModel"]:
