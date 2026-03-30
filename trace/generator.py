@@ -93,6 +93,7 @@ class TraceGenerator:
         qps: float = 10.0,
         block_size_bytes: int = 4096,
         num_system_prompts: int = 8,
+        num_shared_docs: int = 0,
         seed: int = 42,
     ) -> None:
         self.num_sessions = num_sessions
@@ -103,6 +104,7 @@ class TraceGenerator:
         self.qps = qps
         self.block_size = block_size_bytes
         self.num_system_prompts = num_system_prompts
+        self.num_shared_docs = num_shared_docs
         self.rng = random.Random(seed)
         self._tokens_per_block = 16  # vLLM default page size
         # Pre-build shared system prompts (128 tokens each, deterministic)
@@ -111,6 +113,16 @@ class TraceGenerator:
             [sp_rng.randint(0, 50000) for _ in range(128)]
             for _ in range(num_system_prompts)
         ]
+        # Shared document pool: multiple sessions reference the same docs
+        # Models RAG over a common knowledge base or shared code repos
+        self._shared_docs: List[List[int]] = []
+        if num_shared_docs > 0:
+            doc_rng = random.Random(seed + 777)
+            for _ in range(num_shared_docs):
+                doc_len = max(16, initial_context_tokens)
+                self._shared_docs.append(
+                    [doc_rng.randint(0, 50000) for _ in range(doc_len)]
+                )
 
     def _new_tokens(self, n: int) -> List[int]:
         return [self.rng.randint(0, 50000) for _ in range(n)]
@@ -132,8 +144,12 @@ class TraceGenerator:
             sp_idx = s_idx % self.num_system_prompts
             session_tokens = list(self._system_prompts[sp_idx])
 
-            # 2) Per-session initial context (document / RAG / few-shot)
-            if self.initial_context_tokens > 0:
+            # 2) Initial context: shared doc (if pool exists) or per-session
+            if self._shared_docs:
+                # Pick a shared document — multiple sessions hit the same doc
+                doc_idx = s_idx % self.num_shared_docs
+                session_tokens += list(self._shared_docs[doc_idx])
+            elif self.initial_context_tokens > 0:
                 session_tokens += self._session_context_tokens(
                     session_id, self.initial_context_tokens
                 )
@@ -182,5 +198,6 @@ class TraceGenerator:
             qps=tc.get("qps", 10.0),
             block_size_bytes=cc.get("block_size_bytes", 4096),
             num_system_prompts=tc.get("num_system_prompts", 8),
+            num_shared_docs=tc.get("num_shared_docs", 0),
             seed=tc.get("seed", 42),
         )

@@ -89,8 +89,8 @@ trace:
 # ── Cluster trace (higher volume) ───────────────────────────────────
 
 # Cluster trace: mixed workload (RAG + long-doc + multi-turn)
-# Average context ~8K tokens → ~500 blocks → 1 GB KV per session
-# 10 GB HBM = 5,000 blocks → ~10 concurrent sessions before eviction
+# 100 shared docs × 8K tokens: models RAG over a common knowledge base
+# ~80 sessions per doc → high cross-GPU prefix sharing via EIC
 cluster_trace:
   num_sessions: 8000
   turns_per_session: 4
@@ -98,6 +98,7 @@ cluster_trace:
   prompt_tokens_max: 4096
   initial_context_tokens: 8192    # 8K RAG/doc context per session
   num_system_prompts: 20
+  num_shared_docs: 100            # 100 shared documents (RAG knowledge base)
   qps: 200.0
   seed: 42
 
