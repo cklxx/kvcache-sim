@@ -20,7 +20,7 @@
 
 hardware:
   hbm:
-    capacity_gb: 60             # H100 80GB minus model weights
+    capacity_gb: 5              # 70B model: 80GB - 65GB weights - 10GB activations
     read_bw_gbps: 3350
     write_bw_gbps: 3350
     read_latency_ms: 0.001      # ~1 μs
@@ -36,7 +36,7 @@ hardware:
     read_latency_ms: 0.5        # ~500 μs
 
 cache:
-  block_size_bytes: 2097152     # 2 MB = 16 tokens × 128 KB/token (vLLM page)
+  block_size_bytes: 10485760    # 10 MB = 16 tokens × 640 KB/token (70B vLLM page)
   num_workers: 4
   promote_on_hit: true
   async_backup: true
@@ -53,7 +53,7 @@ cluster:
   simulate_gpus_per_rack: 16    # 8×16 = 128 GPUs simulated
 
   gpu:
-    hbm_capacity_gb: 10         # KV budget for 70B model (80GB - 65GB weights - 5GB activations)
+    hbm_capacity_gb: 5          # KV budget for 70B model (80GB - 65GB weights - 10GB activations)
     hbm_read_bw_gbps: 3350
     hbm_write_bw_gbps: 3350
     hbm_latency_ms: 0.001
@@ -134,10 +134,10 @@ pd_separation:
   compute:
     prefill_tflops: 800          # H100 FP16 effective TFLOPS
     decode_memory_bw_gbps: 3350  # H100 HBM bandwidth
-    model_params_b: 7            # Llama-3-8B
-    kv_bytes_per_token: 131072   # 128 KB (2 × 128 × 8 × 2B × 32L)
+    model_params_b: 70           # Llama-3-70B
+    kv_bytes_per_token: 655360   # 640 KB (2 × 128 × 80heads × 2B × 80L / 8 GQA)
     tokens_per_block: 16         # vLLM default page size
-    overhead_factor: 1.0
+    overhead_factor: 1.0         # 70B: prefill ~0.35ms/tok, decode ~83.6ms/tok
     prefill_batch_efficiency: 0.85
     decode_kv_overhead_factor: 0.02
 
