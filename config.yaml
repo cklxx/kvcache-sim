@@ -98,7 +98,9 @@ cluster_trace:
   prompt_tokens_max: 4096
   initial_context_tokens: 8192    # 8K RAG/doc context per session
   num_system_prompts: 20
-  num_shared_docs: 100            # 100 shared documents (RAG knowledge base)
+  num_shared_docs: 200            # 200 shared documents (RAG knowledge base)
+  num_rag_chunks: 3               # retrieve 3 chunks per query
+  doc_zipf_alpha: 1.2             # Zipf skew: top docs queried much more
   qps: 200.0
   seed: 42
 
@@ -156,6 +158,22 @@ pd_trace:
   initial_context_tokens: 8192    # 8K context per session
   num_system_prompts: 32
   qps: 100.0
+  seed: 42
+
+# Agent trace: long-context tool-use sessions (20-50 turns)
+# Context grows to 32K-128K tokens per session
+# Tool definitions shared across sessions (hot prefix via EIC)
+agent_trace:
+  num_sessions: 500
+  turns_min: 15
+  turns_max: 50
+  tool_def_tokens: 2048           # shared tool definitions
+  tool_result_min: 128            # small API responses
+  tool_result_max: 4096           # large code/doc results
+  reasoning_tokens: 256           # agent thinking per turn
+  num_tool_sets: 5                # 5 shared tool definition sets
+  num_system_prompts: 5
+  qps: 20.0
   seed: 42
 
 pd_experiments:

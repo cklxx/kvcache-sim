@@ -275,6 +275,164 @@ class BeladyOracle(EvictionPolicy):
         return "BeladyOracle"
 
 
+# ----------------------------------------------------------------------
+# Importance-Aware (for long-context / agent workloads)
+# ----------------------------------------------------------------------
+
+
+class ImportancePolicy(EvictionPolicy):
+    """
+    Importance-aware eviction for long-context and agent workloads.
+
+    Block importance is a weighted combination of:
+      - Recency (LRU component)
+      - Frequency (access count)
+      - Prefix depth (shallow = system prompt/tool defs = critical)
+      - Pinned flag (system prompt blocks never evicted)
+
+    Eviction priority (lower = evict first):
+      score = recency_score + frequency_score + depth_bonus + pin_bonus
+
+    This models production strategies like H2O (Heavy Hitter Oracle),
+    StreamingLLM (keep attention sinks), and SnapKV (observation-based).
+    """
+
+    def __init__(
+        self,
+        pin_depth: int = 0,
+        depth_weight: float = 2.0,
+        frequency_weight: float = 1.0,
+        recency_weight: float = 1.0,
+    ) -> None:
+        self._access_times: Dict[str, float] = {}  # last access
+        self._access_counts: Dict[str, int] = {}
+        self._depths: Dict[str, int] = {}
+        self._pin_depth = pin_depth  # blocks with depth <= this are pinned
+        self._depth_weight = depth_weight
+        self._frequency_weight = frequency_weight
+        self._recency_weight = recency_weight
+        self._current_time: float = 0.0
+
+    def record_access(self, block_hash: str, current_time: float) -> None:
+        self._access_times[block_hash] = current_time
+        self._access_counts[block_hash] = self._access_counts.get(block_hash, 0) + 1
+        self._current_time = current_time
+
+    def set_depth(self, block_hash: str, depth: int) -> None:
+        """Set prefix depth for importance scoring."""
+        self._depths[block_hash] = depth
+
+    def _score(self, block_hash: str) -> float:
+        """Higher score = more important = evict last."""
+        # Pinned blocks (system prompt, tool defs) — never evict
+        depth = self._depths.get(block_hash, 999)
+        if depth <= self._pin_depth:
+            return float("inf")
+
+        # Recency: how recently accessed (log scale)
+        last = self._access_times.get(block_hash, 0.0)
+        recency = 1.0 / (1.0 + self._current_time - last)
+
+        # Frequency: how often accessed
+        count = self._access_counts.get(block_hash, 1)
+        frequency = min(count, 20) / 20.0  # cap at 20
+
+        # Depth bonus: shallow blocks (near prefix start) are more valuable
+        # because they are shared by more requests
+        depth_bonus = 1.0 / (1.0 + depth * 0.01)
+
+        return (
+            self._recency_weight * recency
+            + self._frequency_weight * frequency
+            + self._depth_weight * depth_bonus
+        )
+
+    def evict_candidate(self, blocks: Dict) -> Optional[str]:
+        if not blocks:
+            return None
+        # Evict the block with the LOWEST importance score
+        return min(blocks, key=self._score)
+
+    def remove(self, block_hash: str) -> None:
+        self._access_times.pop(block_hash, None)
+        self._access_counts.pop(block_hash, None)
+        self._depths.pop(block_hash, None)
+
+    def name(self) -> str:
+        return "Importance"
+
+
+# ----------------------------------------------------------------------
+# Sliding Window + Landmark (for very long context / agent)
+# ----------------------------------------------------------------------
+
+
+class SlidingWindowPolicy(EvictionPolicy):
+    """
+    Sliding window eviction with landmark preservation.
+
+    Strategy for agent / very long context:
+      1. ALWAYS keep: first ``landmark_blocks`` blocks (system prompt,
+         tool defs, initial instructions) — these are "attention sinks"
+      2. ALWAYS keep: last ``window_blocks`` blocks (recent turns)
+      3. Evict from the MIDDLE using LRU
+
+    This mirrors StreamingLLM / attention-sink patterns where the first
+    and last tokens carry disproportionate attention weight.
+
+    ┌──────────┬──────────────────────────────────┬──────────────┐
+    │ LANDMARK │      MIDDLE (evictable, LRU)     │    WINDOW    │
+    │ (pinned) │                                   │   (pinned)   │
+    │ sys+tool │  old turns, stale tool results    │ recent turns │
+    └──────────┴──────────────────────────────────┴──────────────┘
+    """
+
+    def __init__(
+        self,
+        landmark_blocks: int = 200,
+        window_blocks: int = 500,
+    ) -> None:
+        self._landmark_blocks = landmark_blocks
+        self._window_blocks = window_blocks
+        self._lru = LRUPolicy()
+        self._depths: Dict[str, int] = {}
+        self._max_depth_seen: int = 0
+
+    def record_access(self, block_hash: str, current_time: float) -> None:
+        self._lru.record_access(block_hash, current_time)
+
+    def set_depth(self, block_hash: str, depth: int) -> None:
+        self._depths[block_hash] = depth
+        self._max_depth_seen = max(self._max_depth_seen, depth)
+
+    def _is_protected(self, block_hash: str) -> bool:
+        depth = self._depths.get(block_hash, 999)
+        # Landmark: first N blocks (system prompt + tool defs)
+        if depth < self._landmark_blocks:
+            return True
+        # Window: last N blocks (recent context)
+        if depth > self._max_depth_seen - self._window_blocks:
+            return True
+        return False
+
+    def evict_candidate(self, blocks: Dict) -> Optional[str]:
+        if not blocks:
+            return None
+        # Only evict from the middle (non-protected) region
+        for h in self._lru._order:
+            if h in blocks and not self._is_protected(h):
+                return h
+        # If everything is protected, fall back to pure LRU
+        return self._lru.evict_candidate(blocks)
+
+    def remove(self, block_hash: str) -> None:
+        self._lru.remove(block_hash)
+        self._depths.pop(block_hash, None)
+
+    def name(self) -> str:
+        return "SlidingWindow"
+
+
 # ======================================================================
 # Prefetch policies
 # ======================================================================
