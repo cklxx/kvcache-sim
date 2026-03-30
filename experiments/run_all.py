@@ -27,7 +27,7 @@ from sim.policies import (
 )
 from sim.router import Router, Worker
 from sim.storage import StorageTier
-from trace.generator import Request
+from trace.generator import Request, TraceGenerator
 from trace.replay import TraceReplayer
 
 
@@ -243,6 +243,87 @@ class ClusterExperimentRunner:
                 f"EIC={metrics.tier_hit_rate('EIC'):.2%}  "
                 f"evict={metrics.evictions}"
             )
+
+        return results
+
+
+class ClusterContextExperiment:
+    """
+    Sweep context length from 512 → 128K tokens.
+
+    Shows how per-request cache footprint affects:
+      - HBM hit rate (drops with longer context)
+      - EIC value  (increases with longer context)
+      - Eviction pressure
+    """
+
+    CONTEXTS = [
+        #  label              init_ctx  sessions  turns  num_req  warmup  min_t  max_t
+        ("Short  (512 tok)",       256,    5000,     5,    8000,  1000,    64,   128),
+        ("Medium (4K tok)",       3072,    2000,     5,    5000,   500,   128,   512),
+        ("Long   (32K tok)",     30720,     500,     4,    2000,   200,   128,   512),
+        ("VLong  (128K tok)",   126976,     150,     3,     450,    50,   256,  1024),
+    ]
+
+    def __init__(self, config: dict) -> None:
+        self.config = config
+
+    def run(self) -> dict:
+        """
+        For each context length, run with EIC and without EIC.
+
+        Returns
+        -------
+        dict[label → {"eic": Metrics, "no_eic": Metrics,
+                       "blocks_per_req": int, "eic_xgpu": int}]
+        """
+        from sim.cluster import build_cluster
+        from trace.cluster_replay import ClusterReplayer
+        import copy
+
+        results = {}
+        for label, init_ctx, sessions, turns, num_req, warmup, min_t, max_t in self.CONTEXTS:
+            print(f"  [{label}]", flush=True)
+            gen = TraceGenerator(
+                num_sessions=sessions,
+                turns_per_session=turns,
+                prompt_tokens_min=min_t,
+                prompt_tokens_max=max_t,
+                initial_context_tokens=init_ctx,
+                num_system_prompts=self.config.get("cluster_trace", {}).get("num_system_prompts", 20),
+                qps=500.0,
+                block_size_bytes=self.config.get("cache", {}).get("block_size_bytes", 4096),
+                seed=42,
+            )
+            requests = gen.generate()[:num_req]
+            avg_blocks = sum(len(r.block_hashes) for r in requests) / max(len(requests), 1)
+            print(f"    trace: {len(requests)} reqs, avg {avg_blocks:.0f} blocks/req")
+
+            # ── With EIC ────────────────────────────────────────────
+            cluster = build_cluster(self.config)
+            replayer = ClusterReplayer(cluster, warmup_count=warmup)
+            m_eic = replayer.run(requests)
+            xgpu = cluster.total_cross_gpu_eic_hits
+
+            # ── Without EIC ─────────────────────────────────────────
+            cfg_no = _override_eic(self.config, 0.0, 0)
+            cluster_no = build_cluster(cfg_no)
+            replayer_no = ClusterReplayer(cluster_no, warmup_count=warmup)
+            m_no = replayer_no.run(requests)
+
+            delta = m_eic.hit_rate - m_no.hit_rate
+            print(
+                f"    no_eic: hit={m_no.hit_rate:.2%}  "
+                f"w/eic: hit={m_eic.hit_rate:.2%} (+{delta:.2%})  "
+                f"EIC_tier={m_eic.tier_hit_rate('EIC'):.2%}  xGPU={xgpu}"
+            )
+
+            results[label] = {
+                "eic": m_eic,
+                "no_eic": m_no,
+                "blocks_per_req": int(avg_blocks),
+                "eic_xgpu": xgpu,
+            }
 
         return results
 

@@ -1,10 +1,11 @@
 # kvcache-sim
 
-> Multi-tier KV-cache simulator for LLM serving — from single-node to 万卡 cluster with EIC disaggregated memory.
+> Multi-tier KV-cache simulator for LLM serving — from single-node to 万卡 cluster with EIC disaggregated memory and Prefill-Decode separation.
 
-Two simulation modes:
+Three simulation modes:
 - **Single-node**: 4 workers, HBM → DRAM → SSD hierarchy, 6 eviction/prefetch policies
 - **Cluster** (万卡): 10,240 GPUs across 160 racks, shared EIC (CXL/RDMA) per rack, prefix-aware routing
+- **PD Separated**: Prefill-Decode disaggregated serving with radix tree KV cache, continuous batching, KV transfer modeling
 
 ---
 
@@ -38,33 +39,63 @@ Two simulation modes:
   │  │   └───┬───┘         │        │   └─────┬──────│              │
   │  │  ┌────▼────────┐    │        │  ┌──────▼─────┐│              │
   │  │  │  EIC Pool   │    │        │  │  EIC Pool  ││              │
-  │  │  │ (4 nodes    │    │        │  │ (4 nodes   ││              │
-  │  │  │  shared CXL)│    │        │  │  shared)   ││              │
+  │  │  │ (shared CXL)│    │        │  │ (shared)   ││              │
   │  │  └─────────────┘    │        │  └────────────┘│              │
   │  └─────────────────────┘        └────────────────┘              │
-  │                                                                  │
   │  Network: intra-rack 3μs (RDMA) │ cross-rack 15μs │ SSD 200μs  │
   └──────────────────────────────────────────────────────────────────┘
 ```
 
-**EIC (External Interconnect Cache)** = disaggregated CXL/RDMA memory shared across all GPUs in a rack. When GPU A evicts a block from HBM, it lands in the shared EIC. GPU B in the same rack can hit on that block — enabling cross-GPU prefix reuse without recomputation.
+### PD Separation Mode
+
+```
+  PDCluster: 128 GPUs (32 Prefill + 96 Decode, P:D = 1:3)
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                                                                  │
+  │  Request ──▶ PrefillRouter ──▶ PrefillNode                      │
+  │              (prefix match      │                                │
+  │               + load balance)   │ RadixTree lookup               │
+  │                                 │ (prefix sharing, ref counting) │
+  │                                 │ Compute new KV blocks          │
+  │                                 │ SessionAware prefetch          │
+  │                                 ▼                                │
+  │                          KV Transfer (RDMA push)                 │
+  │                          0.01ms @ 100 Gbps                      │
+  │                                 │                                │
+  │              DecodeRouter ◀─────┘                                │
+  │              (same-rack pref    │                                │
+  │               + capacity)       ▼                                │
+  │                           DecodeNode                             │
+  │                           │ Continuous batching                  │
+  │                           │ All active sequences per step        │
+  │                           │ Memory-bandwidth bound               │
+  │                           ▼                                      │
+  │                     Output tokens                                │
+  │                                                                  │
+  │  Per rack: [P P P P | D D D D D D D D D D D D] + shared EIC     │
+  └──────────────────────────────────────────────────────────────────┘
+
+  TTFT = queue_wait + prefill_compute + kv_transfer + first_decode
+  Key insight: Unified GPU is blocked for prefill + ALL decode steps.
+               PD separation frees the prefill GPU after compute only.
+```
 
 ---
 
 ## Quick Start
 
 ```bash
-# 1. Clone
-git clone https://github.com/cklxx/kvcache-sim.git && cd kvcache-sim
-
-# 2. Install
+# Install
 pip install -r requirements.txt
 
-# 3a. Single-node demo (6 policies)
+# Single-node demo (6 policies, HBM → DRAM → SSD)
 python main.py
 
-# 3b. 万卡 cluster + EIC demo
+# 万卡 cluster + EIC demo
 python main.py --cluster
+
+# PD separation analysis (unified vs PD, P:D ratio sweep, transfer strategies)
+python main.py --pd
 ```
 
 ---
@@ -79,27 +110,107 @@ kvcache-sim/
 │   ├── cache_manager.py  # Single-node multi-tier cache orchestrator
 │   ├── router.py         # Prefix trie + worker pool router
 │   ├── metrics.py        # Counters, KPIs, matplotlib visualiser
-│   ├── network.py        # Network latency model (intra-rack / cross-rack / SSD)
-│   └── cluster.py        # GPUNode, EICPool, Rack, Cluster, ClusterRouter
+│   ├── network.py        # Network latency model (intra/cross-rack, P2P RDMA)
+│   ├── cluster.py        # GPUNode, EICPool, Rack, Cluster, ClusterRouter
+│   ├── radix_tree.py     # KV cache radix tree (prefix sharing, ref counting)
+│   ├── pd_nodes.py       # PrefillNode, DecodeNode, compute models
+│   ├── pd_router.py      # PrefillRouter, DecodeRouter, PDOrchestrator
+│   ├── pd_cluster.py     # PDCluster, PDConfig, build_pd_cluster
+│   ├── pd_metrics.py     # TTFT/TPOT distributions, transfer stats
+│   └── kv_transfer.py    # KV transfer protocol (push/pull/pipeline)
 ├── trace/
 │   ├── generator.py      # Synthetic multi-turn trace (shared system prompts)
 │   ├── replay.py         # Single-node trace replay
-│   └── cluster_replay.py # Cluster-scale trace replay
+│   ├── cluster_replay.py # Cluster-scale trace replay
+│   └── pd_replay.py      # PD-separated trace replay
 ├── learned/
 │   ├── features.py       # 8-dim feature engineering
 │   ├── train.py          # LightGBM training pipeline
 │   └── model.py          # Online inference wrapper
 ├── experiments/
 │   ├── run_all.py        # Single-node + cluster experiments
+│   ├── pd_experiments.py # PD separation experiments
 │   └── plot.py           # matplotlib comparison plots
-├── config.yaml           # Full configuration (single-node + cluster)
+├── config.yaml           # Full configuration (all three modes)
 ├── requirements.txt
-└── main.py               # Entry point (--cluster for 万卡 mode)
+└── main.py               # Entry point (--cluster / --pd)
 ```
 
 ---
 
-## Policy Descriptions
+## PD Separation: Key Concepts
+
+### Why PD Separation?
+
+In **unified** serving, a GPU does prefill (process prompt) then decode (generate tokens) sequentially. The decode phase (128 tokens × 8.75ms = 1.12s for 7B) **blocks** the GPU from accepting new prefill requests — this is head-of-line blocking.
+
+**PD separation** dedicates GPUs to each phase:
+- **Prefill nodes**: Compute-bound, process prompts, free immediately after
+- **Decode nodes**: Memory-bandwidth-bound, generate tokens via continuous batching
+- **KV transfer**: RDMA push of KV cache from prefill → decode node
+
+### Components
+
+| Component | Description |
+|-----------|-------------|
+| **RadixTree** | Prefix-sharing block tree with reference counting and leaf-only eviction |
+| **PrefillNode** | RadixTree-backed cache + session-aware prefetch + continuous batching |
+| **DecodeNode** | Receives KV via RDMA, continuous batching of active sequences |
+| **KVTransferModel** | Push/pull strategies, pipeline support, bandwidth modeling |
+| **PrefillRouter** | Prefix cache hit scoring + queue-aware load balancing |
+| **DecodeRouter** | Same-rack preference (fast transfer) + capacity-aware |
+
+### Compute Model (H100, 7B)
+
+| Phase | Formula | Value |
+|-------|---------|-------|
+| Prefill | `2 × params / TFLOPS` | 0.035 ms/token |
+| Decode | `2 × params / HBM_BW` | 8.75 ms/token |
+| Decode (64 seq batch) | base + marginal KV overhead | ~9.8 ms/step |
+| KV transfer (1K tokens) | `bytes / RDMA_BW` | 0.005 ms |
+| KV transfer (128K tokens) | `bytes / RDMA_BW` | 0.65 ms |
+
+---
+
+## PD Separation: Example Results
+
+```
+================================================================
+  kvcache-sim  —  PD Separation Mode
+  PDCluster: 128 GPUs (32P + 96D, ratio 1:3) × 8 racks
+================================================================
+
+Unified vs PD-Separated:
+╭──────────────┬──────────┬──────────┬──────────┬──────────┬───────────╮
+│ Config       │ TTFT_p50 │ TPOT_avg │ Prefill  │ Transfer │ QueueWait │
+├──────────────┼──────────┼──────────┼──────────┼──────────┼───────────┤
+│ Unified      │ 15840 ms │   8.8 ms │  12.7 ms │     0 ms │  15353 ms │
+│ PD Separated │   847 ms │   8.9 ms │  12.6 ms │  0.01 ms │    853 ms │
+╰──────────────┴──────────┴──────────┴──────────┴──────────┴───────────╯
+
+  PD separation: 18.7× lower TTFT
+  Root cause: Unified GPU blocked by decode (128 × 8.75ms = 1120ms per request)
+  Transfer overhead: 0.01ms — negligible at 100 Gbps RDMA
+
+P:D Ratio Sweep:
+╭──────────┬──────────┬───────────┬───────────╮
+│ P:D      │ TTFT_p50 │ PrefixHit │ SameRack  │
+├──────────┼──────────┼───────────┼───────────┤
+│ 1:1      │   427 ms │    65.3%  │     92%   │
+│ 1:2      │   701 ms │    60.8%  │     80%   │
+│ 1:3      │   853 ms │    66.7%  │     97%   │
+│ 1:4      │  1258 ms │    52.4%  │     59%   │
+│ 1:7      │  2302 ms │    34.6%  │     32%   │
+╰──────────┴──────────┴───────────┴───────────╯
+
+  Fewer prefill nodes → higher TTFT (queue buildup)
+  Fewer prefill nodes → lower prefix cache hit (less cache capacity)
+  Fewer prefill nodes → more cross-rack transfers (fewer co-located P-D pairs)
+```
+
+---
+
+## Single-Node: Policy Comparison
 
 | # | Policy | Eviction | Prefetch | Notes |
 |---|--------|----------|----------|-------|
@@ -112,51 +223,35 @@ kvcache-sim/
 
 ---
 
-## Cluster Configuration
+## Configuration
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `total_gpus` | 10,240 | Full cluster GPU count |
-| `simulate_racks` | 8 | Racks simulated in detail |
-| `simulate_gpus_per_rack` | 16 | GPUs per simulated rack |
-| `eic.nodes_per_rack` | 4 | EIC memory nodes per rack |
-| `eic.capacity_per_node_gb` | 0.02 | Capacity per EIC node (scaled) |
-| `network.intra_rack_latency_us` | 3 | GPU ↔ EIC latency (CXL/RDMA) |
-| `network.cross_rack_latency_us` | 15 | Spine fabric latency |
-| `network.remote_ssd_latency_us` | 200 | Disaggregated NVMe-oF |
+All parameters in `config.yaml`. Key PD separation settings:
+
+```yaml
+pd_separation:
+  pd_ratio: [1, 3]              # Prefill:Decode GPU ratio
+  compute:
+    prefill_tflops: 800          # H100 FP16 effective TFLOPS
+    decode_memory_bw_gbps: 3200  # H100 HBM bandwidth
+    model_params_b: 7            # Model size (billions)
+    prefill_batch_efficiency: 0.85
+    decode_kv_overhead_factor: 0.02
+  transfer:
+    strategy: push               # push | pull | pull_on_demand
+    rdma_bw_gbps: 100
+    pipelining: true
+```
 
 ---
 
-## Example: Cluster EIC Sizing Results
+## What You Can Optimize With This Simulator
 
-```
-================================================================
-  kvcache-sim  —  万卡 Cluster + EIC Demo
-  Full cluster: 10,240 GPUs  |  Simulating: 128 GPUs (8 racks × 16)
-================================================================
-
-╭───────────────────┬──────────┬────────┬───────┬──────────┬────────────┬───────────╮
-│ Policy            │ HitRate  │ HBM    │ EIC   │ Remote   │ AvgLat(ms) │ Evictions │
-├───────────────────┼──────────┼────────┼───────┼──────────┼────────────┼───────────┤
-│ No EIC (HBM only) │ 71.20%   │ 71.20% │ 0.00% │ 0.00%   │ 0.001      │     5,257 │
-│ EIC 2×20 MB       │ 71.39%   │ 71.17% │ 0.22% │ 0.00%   │ 0.001      │    25,238 │
-│ EIC 4×20 MB       │ 71.39%   │ 71.18% │ 0.21% │ 0.00%   │ 0.001      │    21,167 │
-│ EIC 4×50 MB       │ 71.39%   │ 71.20% │ 0.20% │ 0.00%   │ 0.001      │    22,031 │
-│ EIC 8×50 MB       │ 71.39%   │ 71.19% │ 0.20% │ 0.00%   │ 0.001      │    21,710 │
-╰───────────────────┴──────────┴────────┴───────┴──────────┴────────────┴───────────╯
-
-Cluster Topology:
-  128 GPUs × 8 racks, 32 EIC nodes
-  Total HBM: 0.4 GB  |  Total EIC: 0.7 GB
-  EIC utilization: R0=83%, R1=88%, R2=68%, R3=42%, R4=36%, R5=21%
-  Cross-GPU EIC hits (shared prefix reuse): 512
-```
-
-Key findings:
-- **EIC adds +0.19% hit rate** by catching HBM evictions and enabling cross-GPU prefix sharing
-- **512 cross-GPU EIC hits** show different GPUs in the same rack reusing shared system prompt blocks via CXL
-- **EIC utilization is skewed** across racks (83% → 0%) due to session-affinity routing concentrating traffic
-- **ARC pushes 5.93% of hits to EIC** (vs 0.21% for LRU) — worse latency but same hit rate
+1. **P:D Ratio Selection** — Find optimal prefill/decode GPU split for your QPS and prompt lengths
+2. **Prefix Cache Capacity Planning** — How much HBM/EIC to allocate for KV cache vs model weights
+3. **Interconnect Bandwidth ROI** — Compare 25/50/100/200 Gbps for KV transfer overhead
+4. **Eviction Policy Selection** — LRU vs ARC vs Learned under different workload patterns
+5. **EIC Sizing** — How much shared CXL memory per rack for cross-GPU prefix reuse
+6. **Context Length Impact** — How 4K vs 32K vs 128K contexts affect cache dynamics and PD benefit
 
 ---
 
