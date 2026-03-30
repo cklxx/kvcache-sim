@@ -212,10 +212,12 @@ class PDOrchestrator:
             total_bytes=prefill_result.kv_bytes,
         )
         full_transfer_ms = self.transfer_model.transfer_latency_ms(
-            len(prefill_result.block_hashes), request.block_size, same_rack
+            len(prefill_result.block_hashes), request.block_size, same_rack,
+            src_gpu=p_node.gpu_id, dst_gpu=d_node.gpu_id,
         )
         ttft_transfer_ms = self.transfer_model.effective_ttft_transfer_ms(
-            len(prefill_result.block_hashes), request.block_size, same_rack
+            len(prefill_result.block_hashes), request.block_size, same_rack,
+            src_gpu=p_node.gpu_id, dst_gpu=d_node.gpu_id,
         )
 
         # ── 5. Decode receives KV ──

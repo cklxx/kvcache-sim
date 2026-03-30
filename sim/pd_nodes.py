@@ -242,14 +242,15 @@ class PrefillNode:
         current_time: float,
     ) -> PrefillResult:
         """
-        Execute prefill phase for a request.
+        Execute prefill with RDMA-optimised EIC prefetch.
 
-        1. Look up prefix in radix tree (cache hit → skip compute)
-        2. Check EIC for additional hits
-        3. Compute KV for remaining (new) tokens
-        4. Insert new blocks into radix tree
-        5. Run prefetch: predict next-turn blocks and pre-load
-        6. Return result with timing
+        Pipeline:
+          1. RadixTree lookup (local HBM) → instant
+          2. Batch probe EIC for ALL remaining hashes → 1 RTT (5μs)
+          3. Async batch fetch EIC hits via RDMA → overlaps with GPU compute
+          4. GPU computes KV for true misses → overlaps with RDMA fetch
+          5. Insert new blocks + prefetch next-turn
+          6. Effective time = max(rdma_fetch, gpu_compute)
         """
         block_hashes = request.block_hashes
         block_size = request.block_size
@@ -258,25 +259,49 @@ class PrefillNode:
         effective_time = max(current_time, self.earliest_available_time)
         queue_wait = effective_time - current_time
 
-        # 1. Radix tree lookup — find cached prefix
+        # ── 1. RadixTree lookup (local HBM, instant) ────────────
         match_depth, matched_nodes = self.radix_tree.lookup_prefix(block_hashes)
-        cached_blocks = match_depth
+        hbm_hits = match_depth
+        remaining_hashes = block_hashes[match_depth:]
 
-        # 2. Check EIC for blocks beyond radix tree match
-        eic_hits = 0
-        for bh in block_hashes[match_depth:]:
-            blk = self.eic.read(bh, self.gpu_id, effective_time)
-            if blk is not None:
-                eic_hits += 1
-                self.metrics.record_hit("EIC", 0.0)
+        # ── 2. Batch probe EIC for ALL remaining hashes ─────────
+        # One RDMA round-trip with all hashes, not per-block
+        # Probe cost: 1 RTT = intra_rack_latency + rdma_base ≈ 8μs
+        eic_hit_hashes: List[str] = []
+        eic_miss_hashes: List[str] = []
+        for bh in remaining_hashes:
+            if self.eic.contains(bh):
+                eic_hit_hashes.append(bh)
             else:
-                break  # prefix chain broken
+                eic_miss_hashes.append(bh)
+        probe_latency_ms = self.network.intra_rack_ms()  # single RTT
 
-        total_cached = cached_blocks + eic_hits
-        new_blocks = len(block_hashes) - total_cached
+        # ── 3. Async batch fetch EIC hits (RDMA one-sided READ) ─
+        # GPUDirect RDMA: write directly to GPU HBM, bypass CPU
+        # Transfer time = total_bytes / rdma_bw
+        eic_fetch_bytes = len(eic_hit_hashes) * block_size
+        rdma_bw_bytes_per_ms = self.network.p2p_rdma_bw_gbps * 1e9 / 1000.0
+        eic_fetch_ms = 0.0
+        if eic_hit_hashes:
+            eic_fetch_ms = (
+                probe_latency_ms
+                + eic_fetch_bytes / rdma_bw_bytes_per_ms
+            )
+            # Actually read from EIC and promote to local tree
+            for bh in eic_hit_hashes:
+                blk = self.eic.read(bh, self.gpu_id, effective_time)
+                if blk is not None:
+                    self.radix_tree.insert_sequence(
+                        [bh], block_size, effective_time + eic_fetch_ms
+                    )
+                    self.metrics.record_hit("EIC", eic_fetch_ms)
+
+        eic_hits = len(eic_hit_hashes)
+        total_cached = hbm_hits + eic_hits
+        new_blocks = len(eic_miss_hashes)
 
         # Record cache metrics
-        for _ in range(cached_blocks):
+        for _ in range(hbm_hits):
             self.metrics.total_requests += 1
             lat = self.hbm.transfer_latency_ms(block_size, is_read=True)
             self.metrics.record_hit("HBM", lat)
@@ -284,39 +309,42 @@ class PrefillNode:
             self.metrics.total_requests += 1
             self.metrics.record_miss()
 
-        # 3. Compute time for new tokens (continuous batching aware)
+        # ── 4. GPU computes KV for true misses ──────────────────
+        # This OVERLAPS with the RDMA fetch above
         new_tokens = new_blocks * self.compute_cfg.tokens_per_block
-        # Check if there are other requests in flight (batch > 1)
         batch_size = max(1, self.queue_depth)
-        compute_ms = self.compute_cfg.batched_prefill_ms(new_tokens, batch_size)
+        gpu_compute_ms = self.compute_cfg.batched_prefill_ms(new_tokens, batch_size)
 
-        # 4. Insert new blocks into radix tree + async EIC backup
-        new_hashes = block_hashes[total_cached:]
-        self.radix_tree.insert_sequence(
-            new_hashes, block_size, effective_time + compute_ms
-        )
+        # ── Effective time = max(rdma_fetch, gpu_compute) ───────
+        # RDMA and GPU operate in parallel (async DMA engine)
+        compute_ms = max(eic_fetch_ms, gpu_compute_ms)
+
+        # ── 5. Insert new blocks + async EIC backup ─────────────
+        if eic_miss_hashes:
+            self.radix_tree.insert_sequence(
+                eic_miss_hashes, block_size, effective_time + compute_ms
+            )
         self.radix_tree.acquire_sequence(block_hashes)
 
-        # Async EIC backup for new blocks
-        for bh in new_hashes:
+        # Async EIC backup for newly computed blocks
+        for i, bh in enumerate(eic_miss_hashes):
             blk = KVBlock(
                 block_hash=bh,
                 size_bytes=block_size,
-                prefix_depth=block_hashes.index(bh) if bh in block_hashes else 0,
+                prefix_depth=hbm_hits + eic_hits + i,
                 last_access_time=effective_time + compute_ms,
                 access_count=1,
             )
             if not self.eic.contains(bh):
                 self.eic.write(blk, self.gpu_id, effective_time + compute_ms)
 
-        # 5. Prefetch: predict and pre-load next-turn blocks
+        # ── 6. Prefetch next-turn blocks from EIC ───────────────
         prefetched = 0
         self.prefetch.record_sequence(request.session_id, block_hashes)
         if block_hashes:
             candidates = self.prefetch.candidates(block_hashes[-1], request.session_id)
             for cand_hash in candidates:
                 if not self.radix_tree.contains(cand_hash):
-                    # Check if available in EIC
                     blk = self.eic.read(cand_hash, self.gpu_id, effective_time + compute_ms)
                     if blk is not None:
                         self.radix_tree.insert_sequence(
@@ -325,7 +353,7 @@ class PrefillNode:
                         prefetched += 1
                         self.metrics.prefetches += 1
 
-        # Update queue model — prefill GPU is free after compute
+        # Update queue model
         self.earliest_available_time = effective_time + compute_ms
 
         kv_bytes = len(block_hashes) * block_size

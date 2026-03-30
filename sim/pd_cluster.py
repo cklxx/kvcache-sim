@@ -163,6 +163,9 @@ def build_pd_cluster(
         remote_ssd_us=net_cfg.get("remote_ssd_latency_us", 200.0),
         p2p_rdma_bw_gbps=net_cfg.get("p2p_rdma_bw_gbps", 100.0),
         p2p_rdma_latency_us=net_cfg.get("p2p_rdma_latency_us", 5.0),
+        nvlink_bw_gbps=net_cfg.get("nvlink_bw_gbps", 900.0),
+        nvlink_latency_us=net_cfg.get("nvlink_latency_us", 1.0),
+        gpus_per_node=net_cfg.get("gpus_per_node", 8),
     )
 
     # Compute P:D split per rack
