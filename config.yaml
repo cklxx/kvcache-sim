@@ -1,16 +1,22 @@
+# ──────────────────────────────────────────────────────────────────────
+# kvcache-sim configuration
+# ──────────────────────────────────────────────────────────────────────
+
+# ── Single-node mode (python main.py) ────────────────────────────────
+
 hardware:
   hbm:
-    capacity_gb: 0.003     # 3 MB per worker — forces heavy eviction
+    capacity_gb: 0.003
     read_bw_gbps: 3200
     write_bw_gbps: 3200
     read_latency_ms: 0.001
   dram:
-    capacity_gb: 0.008     # 8 MB per worker — moderate pressure
+    capacity_gb: 0.008
     read_bw_gbps: 200
     write_bw_gbps: 200
     read_latency_ms: 0.1
   ssd:
-    capacity_gb: 0.1       # 100 MB per worker — cold storage
+    capacity_gb: 0.1
     read_bw_gbps: 7
     write_bw_gbps: 4
     read_latency_ms: 0.5
@@ -21,6 +27,37 @@ cache:
   promote_on_hit: true
   async_backup: true
 
+# ── Cluster mode (python main.py --cluster) ──────────────────────────
+
+cluster:
+  # Full 万卡 cluster description (documentation)
+  total_gpus: 10240           # 10K GPUs total
+  gpus_per_rack: 64           # production rack density
+
+  # Simulation subset (for tractability)
+  simulate_racks: 8
+  simulate_gpus_per_rack: 16  # 8×16 = 128 GPUs simulated
+
+  gpu:
+    hbm_capacity_gb: 0.003    # scaled down (ratio HBM:EIC ≈ 1:27 matches real H100)
+    hbm_read_bw_gbps: 3200
+    hbm_write_bw_gbps: 3200
+    hbm_latency_ms: 0.001
+
+  eic:
+    nodes_per_rack: 4         # 4 EIC nodes per rack
+    capacity_per_node_gb: 0.02  # 20 MB per node → 80 MB shared EIC per rack
+    read_bw_gbps: 100         # CXL 2.0 / RDMA
+    write_bw_gbps: 80
+    access_latency_ms: 0.005  # ~5 μs CXL round-trip
+
+  network:
+    intra_rack_latency_us: 3    # GPU ↔ EIC same rack (RDMA)
+    cross_rack_latency_us: 15   # spine fabric
+    remote_ssd_latency_us: 200  # disaggregated NVMe-oF
+
+# ── Trace ────────────────────────────────────────────────────────────
+
 trace:
   num_sessions: 200
   turns_per_session: 6
@@ -30,13 +67,31 @@ trace:
   qps: 20.0
   seed: 42
 
+# ── Cluster trace (higher volume) ───────────────────────────────────
+
+cluster_trace:
+  num_sessions: 5000
+  turns_per_session: 5
+  prompt_tokens_min: 64
+  prompt_tokens_max: 512
+  num_system_prompts: 20
+  qps: 500.0
+  seed: 42
+
+# ── Policies & experiments ───────────────────────────────────────────
+
 policies:
-  eviction: lru          # lru | arc | learned
-  prefetch: none         # none | session_aware
+  eviction: lru
+  prefetch: none
   selective_write: false
   selective_write_depth_threshold: 6
 
 experiments:
   num_requests: 1200
   warmup_requests: 200
+  output_dir: results
+
+cluster_experiments:
+  num_requests: 8000
+  warmup_requests: 1000
   output_dir: results

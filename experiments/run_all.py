@@ -161,3 +161,97 @@ def _build_future_map(requests: List[Request]) -> dict:
         for bh in req.block_hashes:
             m[bh].append(req.timestamp)
     return {k: sorted(v) for k, v in m.items()}
+
+
+# ======================================================================
+# Cluster-scale experiments
+# ======================================================================
+
+
+class ClusterExperimentRunner:
+    """
+    Run experiments on the 万卡-scale cluster simulator.
+
+    Compares EIC sizing (no EIC / small / medium / large) and
+    eviction policies at cluster scale.
+    """
+
+    def __init__(self, config: dict, warmup: int = 500) -> None:
+        self.config = config
+        self.warmup = warmup
+
+    def run_eic_sizing(self, requests: List[Request]) -> Dict[str, Metrics]:
+        """Compare different EIC capacities per rack."""
+        from sim.cluster import build_cluster
+        from trace.cluster_replay import ClusterReplayer
+
+        configs = [
+            ("No EIC (HBM only)", 0.0, 0),
+            ("EIC 2×20 MB",       0.02, 2),
+            ("EIC 4×20 MB",       0.02, 4),
+            ("EIC 4×50 MB",       0.05, 4),
+            ("EIC 8×50 MB",       0.05, 8),
+        ]
+
+        results: Dict[str, Metrics] = {}
+        for name, cap_per_node, n_nodes in configs:
+            print(f"  [{name}] …", end=" ", flush=True)
+            cfg = _override_eic(self.config, cap_per_node, n_nodes)
+            cluster = build_cluster(cfg)
+            replayer = ClusterReplayer(cluster, warmup_count=self.warmup)
+            metrics = replayer.run(requests)
+            cross = cluster.total_cross_gpu_eic_hits
+            results[name] = metrics
+            print(
+                f"hit={metrics.hit_rate:.2%}  "
+                f"HBM={metrics.tier_hit_rate('HBM'):.2%}  "
+                f"EIC={metrics.tier_hit_rate('EIC'):.2%}  "
+                f"xGPU_EIC={cross}"
+            )
+
+        return results
+
+    def run_eviction_at_scale(self, requests: List[Request], learned_model=None) -> Dict[str, Metrics]:
+        """Compare eviction policies on the cluster."""
+        from sim.cluster import build_cluster
+        from sim.policies import ARCPolicy, LearnedPolicy, BeladyOracle
+        from trace.cluster_replay import ClusterReplayer
+
+        future_map = _build_future_map(requests)
+        configs = [
+            ("LRU (cluster)",   lambda: LRUPolicy()),
+            ("ARC (cluster)",   lambda: ARCPolicy()),
+            ("Belady (cluster)", lambda: BeladyOracle(future_map)),
+        ]
+
+        if learned_model is not None:
+            def _mk_learned():
+                p = LearnedPolicy()
+                p.set_model(learned_model)
+                return p
+            configs.insert(2, ("Learned (cluster)", _mk_learned))
+
+        results: Dict[str, Metrics] = {}
+        for name, factory in configs:
+            print(f"  [{name}] …", end=" ", flush=True)
+            cluster = build_cluster(self.config, eviction_factory=factory)
+            replayer = ClusterReplayer(cluster, warmup_count=self.warmup)
+            metrics = replayer.run(requests)
+            results[name] = metrics
+            print(
+                f"hit={metrics.hit_rate:.2%}  "
+                f"EIC={metrics.tier_hit_rate('EIC'):.2%}  "
+                f"evict={metrics.evictions}"
+            )
+
+        return results
+
+
+def _override_eic(config: dict, capacity_per_node_gb: float, num_nodes: int) -> dict:
+    """Return a copy of config with EIC parameters overridden."""
+    import copy
+    cfg = copy.deepcopy(config)
+    eic = cfg.setdefault("cluster", {}).setdefault("eic", {})
+    eic["capacity_per_node_gb"] = capacity_per_node_gb
+    eic["nodes_per_rack"] = num_nodes
+    return cfg

@@ -3,3 +3,5 @@ from .policies import LRUPolicy, ARCPolicy, LearnedPolicy, NoPrefetch, SessionAw
 from .cache_manager import CacheManager
 from .router import Router
 from .metrics import Metrics
+from .network import NetworkModel
+from .cluster import GPUNode, EICPool, Rack, Cluster, ClusterRouter, build_cluster

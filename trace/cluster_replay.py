@@ -1,0 +1,80 @@
+"""
+ClusterReplayer — drives a ClusterRouter through a request trace.
+
+Replays requests through the cluster router, routing each request to
+the best GPU based on session affinity and prefix match.
+"""
+from __future__ import annotations
+
+from typing import List
+
+from sim.cluster import Cluster, ClusterRouter
+from sim.metrics import Metrics
+from sim.policies import BeladyOracle, SessionAwarePrefetch
+from trace.generator import Request
+
+
+class ClusterReplayer:
+    def __init__(
+        self,
+        cluster: Cluster,
+        warmup_count: int = 0,
+        verbose: bool = False,
+    ) -> None:
+        self.cluster = cluster
+        self.router = ClusterRouter(cluster)
+        self.warmup_count = warmup_count
+        self.verbose = verbose
+
+    def run(self, requests: List[Request]) -> Metrics:
+        # Seed Belady oracles and session-aware prefetch on all GPUs
+        for gpu in self.cluster.all_gpus:
+            if isinstance(gpu.eviction, BeladyOracle):
+                _seed_belady(gpu.eviction, requests)
+            if isinstance(gpu.prefetch, SessionAwarePrefetch):
+                _seed_session_patterns(gpu.prefetch, requests)
+
+        self.cluster.reset_all()
+
+        for i, req in enumerate(requests):
+            gpu = self.router.route(req.block_hashes, req.session_id)
+            gpu.process_request(
+                req.block_hashes,
+                req.block_size,
+                req.session_id,
+                req.timestamp,
+            )
+
+            if i == self.warmup_count - 1:
+                self.cluster.reset_all()
+
+            if self.verbose and i >= self.warmup_count and i % 2000 == 0:
+                m = self.cluster.aggregate_metrics()
+                print(
+                    f"    [{i}/{len(requests)}] hit={m.hit_rate:.2%} "
+                    f"evict={m.evictions} eic_xgpu={self.cluster.total_cross_gpu_eic_hits}"
+                )
+
+        return self.cluster.aggregate_metrics()
+
+
+# ── helpers ───────────────────────────────────────────────────────────
+
+
+def _seed_session_patterns(policy: SessionAwarePrefetch, requests: List[Request]) -> None:
+    from collections import defaultdict
+    sessions: dict = defaultdict(list)
+    for req in requests:
+        sessions[req.session_id].append(req.block_hashes)
+    for sid, seqs in sessions.items():
+        for seq in seqs[:-1]:
+            policy.record_sequence(sid, seq)
+
+
+def _seed_belady(policy: BeladyOracle, requests: List[Request]) -> None:
+    from collections import defaultdict
+    future: dict = defaultdict(list)
+    for req in requests:
+        for bh in req.block_hashes:
+            future[bh].append(req.timestamp)
+    policy._future = {k: sorted(v) for k, v in future.items()}

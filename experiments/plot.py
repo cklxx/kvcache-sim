@@ -14,6 +14,7 @@ def plot_results(
     tier_names: List[str],
     output_dir: str = "results",
     show: bool = False,
+    filename: str = "policy_comparison.png",
 ) -> str:
     """
     Save comparison plots to *output_dir* and optionally display them.
@@ -21,6 +22,6 @@ def plot_results(
     Returns the path to the saved figure.
     """
     os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, "policy_comparison.png")
+    out_path = os.path.join(output_dir, filename)
     plot_comparison(results, tier_names, output_path=out_path, show=show)
     return out_path
