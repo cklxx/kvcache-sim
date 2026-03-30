@@ -29,6 +29,12 @@ class Metrics:
     # Total latency (hits only)
     total_latency_ms: float = 0.0
 
+    # Prefix vs new-block accounting
+    # Separates "should be cached" (prefix) from "first-time compute" (new)
+    prefix_blocks: int = 0      # blocks that existed in previous turns
+    prefix_hits: int = 0        # prefix blocks actually found in cache
+    new_blocks: int = 0         # blocks computed for the first time
+
     def __post_init__(self) -> None:
         for name in self.tier_names:
             self.tier_hits.setdefault(name, 0)
@@ -65,6 +71,13 @@ class Metrics:
         if self.total_requests == 0:
             return 0.0
         return self.tier_hits.get(tier_name, 0) / self.total_requests
+
+    @property
+    def prefix_hit_rate(self) -> float:
+        """Of blocks that SHOULD be cached (prefix), how many actually were?"""
+        if self.prefix_blocks == 0:
+            return 0.0
+        return self.prefix_hits / self.prefix_blocks
 
     @property
     def avg_hit_latency_ms(self) -> float:

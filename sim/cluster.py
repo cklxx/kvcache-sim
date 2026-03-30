@@ -144,6 +144,7 @@ class GPUNode:
         self.selective_write_depth = selective_write_depth
         self.metrics = Metrics(tier_names=["HBM", "EIC", "Remote"])
         self._pending_eic: List[Tuple[KVBlock, float]] = []
+        self._ever_computed: set = set()  # track all blocks ever computed on this GPU
 
     # ── read / write / tick ───────────────────────────────────────────
 
@@ -256,12 +257,29 @@ class GPUNode:
         hits = 0
         total_lat = 0.0
         for depth, bh in enumerate(block_hashes):
+            ever_seen = bh in self._ever_computed
             tier, lat = self.read(bh, block_size, depth, current_time, session_id)
             if tier:
                 hits += 1
                 total_lat += lat
+                if ever_seen:
+                    # Prefix block: computed before, found in cache
+                    self.metrics.prefix_blocks += 1
+                    self.metrics.prefix_hits += 1
+                else:
+                    # Shouldn't happen often (hit on never-computed block)
+                    self.metrics.prefix_blocks += 1
+                    self.metrics.prefix_hits += 1
             else:
                 total_lat += self.write(bh, block_size, depth, current_time, session_id)
+                self._ever_computed.add(bh)
+                if ever_seen:
+                    # EVICTED prefix block: was computed before but got kicked out
+                    self.metrics.prefix_blocks += 1
+                    # prefix_hits NOT incremented → this is a cache miss on a prefix
+                else:
+                    # Truly new block: first-time compute
+                    self.metrics.new_blocks += 1
         self.tick(current_time)
         return hits, total_lat
 
@@ -335,6 +353,9 @@ class Cluster:
             combined.demotions += m.demotions
             combined.prefetches += m.prefetches
             combined.total_latency_ms += m.total_latency_ms
+            combined.prefix_blocks += m.prefix_blocks
+            combined.prefix_hits += m.prefix_hits
+            combined.new_blocks += m.new_blocks
             for t in m.tier_names:
                 combined.tier_hits[t] = (
                     combined.tier_hits.get(t, 0) + m.tier_hits.get(t, 0)
