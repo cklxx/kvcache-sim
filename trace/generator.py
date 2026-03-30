@@ -36,7 +36,7 @@ class Request:
 
 
 def _incremental_block_hashes(
-    tokens: List[int], tokens_per_block: int = 32
+    tokens: List[int], tokens_per_block: int = 16
 ) -> List[str]:
     """
     Build block hashes using incremental chaining — O(N) total.
@@ -104,7 +104,7 @@ class TraceGenerator:
         self.block_size = block_size_bytes
         self.num_system_prompts = num_system_prompts
         self.rng = random.Random(seed)
-        self._tokens_per_block = 32
+        self._tokens_per_block = 16  # vLLM default page size
         # Pre-build shared system prompts (128 tokens each, deterministic)
         sp_rng = random.Random(seed + 999)
         self._system_prompts: List[List[int]] = [
