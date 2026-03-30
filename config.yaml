@@ -53,7 +53,7 @@ cluster:
   simulate_gpus_per_rack: 16    # 8×16 = 128 GPUs simulated
 
   gpu:
-    hbm_capacity_gb: 60         # real H100 KV budget
+    hbm_capacity_gb: 10         # KV budget for 70B model (80GB - 65GB weights - 5GB activations)
     hbm_read_bw_gbps: 3350
     hbm_write_bw_gbps: 3350
     hbm_latency_ms: 0.001
@@ -72,25 +72,30 @@ cluster:
 
 # ── Trace ────────────────────────────────────────────────────────────
 
+# Single-node trace: mixed context lengths
 trace:
-  num_sessions: 5000
-  turns_per_session: 5
-  prompt_tokens_min: 128
-  prompt_tokens_max: 1024
-  initial_context_tokens: 512
-  num_system_prompts: 16
-  qps: 50.0
+  num_sessions: 3000
+  turns_per_session: 4
+  prompt_tokens_min: 256
+  prompt_tokens_max: 2048
+  initial_context_tokens: 4096    # 4K doc context
+  num_system_prompts: 8
+  qps: 30.0
   seed: 42
 
 # ── Cluster trace (higher volume) ───────────────────────────────────
 
+# Cluster trace: mixed workload (RAG + long-doc + multi-turn)
+# Average context ~8K tokens → ~500 blocks → 1 GB KV per session
+# 10 GB HBM = 5,000 blocks → ~10 concurrent sessions before eviction
 cluster_trace:
-  num_sessions: 5000
-  turns_per_session: 5
-  prompt_tokens_min: 64
-  prompt_tokens_max: 512
+  num_sessions: 8000
+  turns_per_session: 4
+  prompt_tokens_min: 512
+  prompt_tokens_max: 4096
+  initial_context_tokens: 8192    # 8K RAG/doc context per session
   num_system_prompts: 20
-  qps: 500.0
+  qps: 200.0
   seed: 42
 
 # ── Policies & experiments ───────────────────────────────────────────
@@ -138,12 +143,13 @@ pd_separation:
     pipeline_chunk_blocks: 16
     compression_ratio: 1.0
 
+# PD trace: realistic RAG + long-doc workload
 pd_trace:
-  num_sessions: 2000
+  num_sessions: 3000
   turns_per_session: 4
-  prompt_tokens_min: 64
-  prompt_tokens_max: 512
-  initial_context_tokens: 256
+  prompt_tokens_min: 512
+  prompt_tokens_max: 4096
+  initial_context_tokens: 8192    # 8K context per session
   num_system_prompts: 32
   qps: 100.0
   seed: 42
