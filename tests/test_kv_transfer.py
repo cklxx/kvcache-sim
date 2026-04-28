@@ -30,3 +30,39 @@ def test_same_node_nvlink_is_not_used_across_racks() -> None:
     )
 
     assert cross_rack_ms > same_rack_ms * 10
+
+
+def test_network_jitter_is_seeded() -> None:
+    first = NetworkModel(jitter_cv=0.25, tail_jitter_prob=0.1, seed=7)
+    second = NetworkModel(jitter_cv=0.25, tail_jitter_prob=0.1, seed=7)
+
+    assert [first.intra_rack_ms() for _ in range(5)] == [
+        second.intra_rack_ms() for _ in range(5)
+    ]
+
+
+def test_transfer_contention_queues_shared_link() -> None:
+    transfer = KVTransferModel(
+        TransferConfig(rdma_bw_gbps=1.0, pipelining=True),
+        NetworkModel(contention_enabled=True, gpus_per_node=1),
+    )
+
+    first = transfer.transfer_timing_ms(
+        num_blocks=1,
+        block_size=1_000_000,
+        same_rack=True,
+        src_gpu=0,
+        dst_gpu=1,
+        start_time_ms=0.0,
+    )
+    second = transfer.transfer_timing_ms(
+        num_blocks=1,
+        block_size=1_000_000,
+        same_rack=True,
+        src_gpu=0,
+        dst_gpu=1,
+        start_time_ms=0.0,
+    )
+
+    assert second.queue_wait_ms == first.full_ms
+    assert second.full_ms == first.full_ms * 2

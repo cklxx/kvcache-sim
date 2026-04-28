@@ -17,6 +17,7 @@ Strategies:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Hashable
 
 from .network import NetworkModel
 
@@ -43,6 +44,16 @@ class TransferConfig:
         )
 
 
+@dataclass(frozen=True)
+class KVTransferTiming:
+    """Full-transfer and TTFT-visible transfer timing."""
+
+    full_ms: float
+    ttft_ms: float
+    queue_wait_ms: float = 0.0
+    path: str = ""
+
+
 class KVTransferModel:
     """Topology-aware KV transfer latency model."""
 
@@ -63,37 +74,101 @@ class KVTransferModel:
 
         Picks NVLink (same node) or RDMA (cross-node) based on GPU IDs.
         """
-        if num_blocks <= 0:
-            return 0.0
-        total_bytes = int(num_blocks * block_size * self.config.compression_ratio)
+        return self.transfer_timing_ms(
+            num_blocks,
+            block_size,
+            same_rack,
+            src_gpu=src_gpu,
+            dst_gpu=dst_gpu,
+        ).full_ms
 
-        # Pick interconnect based on topology
+    def transfer_timing_ms(
+        self,
+        num_blocks: int,
+        block_size: int,
+        same_rack: bool,
+        src_gpu: int = -1,
+        dst_gpu: int = -1,
+        start_time_ms: float | None = None,
+    ) -> KVTransferTiming:
+        """
+        Full and TTFT-visible transfer times for one KV movement.
+
+        When the NetworkModel has contention enabled, this method reserves the
+        selected interconnect once and returns both full-transfer and first
+        pipeline chunk timing from the same queued transfer.
+        """
+        if num_blocks <= 0:
+            return KVTransferTiming(0.0, 0.0)
+
+        total_bytes = int(num_blocks * block_size * self.config.compression_ratio)
+        chunk_blocks = (
+            self.config.pipeline_chunk_blocks
+            if self.config.pipelining
+            else num_blocks
+        )
+        first_bytes = int(
+            min(num_blocks, chunk_blocks) * block_size * self.config.compression_ratio
+        )
+        path, bandwidth_gbps, base_us, link_key = self._path_params(
+            num_blocks,
+            same_rack,
+            src_gpu,
+            dst_gpu,
+        )
+        timing = self.network.schedule_transfer(
+            total_bytes=total_bytes,
+            first_chunk_bytes=first_bytes,
+            bandwidth_gbps=bandwidth_gbps,
+            base_latency_us=base_us,
+            link_key=link_key,
+            start_time_ms=start_time_ms,
+        )
+        return KVTransferTiming(
+            full_ms=timing.full_ms,
+            ttft_ms=timing.first_chunk_ms,
+            queue_wait_ms=timing.queue_wait_ms,
+            path=path,
+        )
+
+    def _path_params(
+        self,
+        num_blocks: int,
+        same_rack: bool,
+        src_gpu: int,
+        dst_gpu: int,
+    ) -> tuple[str, float, float, Hashable]:
         same_node = (
             same_rack
             and src_gpu >= 0
             and dst_gpu >= 0
             and self.network._same_node(src_gpu, dst_gpu)
         )
-
         if same_node:
-            # NVLink: 900 GB/s, 1μs base
-            return self.network.nvlink_transfer_ms(total_bytes)
-        else:
-            # RDMA: 12.5 GB/s, 8-20μs base
-            bw_bytes_per_sec = self.config.rdma_bw_gbps * 1e9
-            transfer_us = (total_bytes / bw_bytes_per_sec) * 1e6
-            base_us = (
-                self.network.intra_rack_us if same_rack else self.network.cross_rack_us
+            node_id = src_gpu // self.network.gpus_per_node
+            return (
+                "nvlink",
+                self.network.nvlink_bw_gbps,
+                self.network.nvlink_latency_us,
+                ("nvlink", node_id),
             )
-            base_us += self.config.rdma_latency_us
 
-            if self.config.strategy == "pull":
-                base_us += base_us  # extra RTT for request
-            elif self.config.strategy == "pull_on_demand":
-                n_chunks = max(1, num_blocks // self.config.pipeline_chunk_blocks)
-                base_us += base_us * n_chunks * 0.1
+        path = "rdma_intra_rack" if same_rack else "rdma_cross_rack"
+        base_us = (
+            self.network.intra_rack_us if same_rack else self.network.cross_rack_us
+        )
+        base_us += self.config.rdma_latency_us
 
-            return (base_us + transfer_us) / 1000.0
+        if self.config.strategy == "pull":
+            base_us += base_us
+        elif self.config.strategy == "pull_on_demand":
+            n_chunks = max(1, num_blocks // self.config.pipeline_chunk_blocks)
+            base_us += base_us * n_chunks * 0.1
+
+        src_node = src_gpu // self.network.gpus_per_node if src_gpu >= 0 else -1
+        dst_node = dst_gpu // self.network.gpus_per_node if dst_gpu >= 0 else -1
+        link_key = (path, min(src_node, dst_node), max(src_node, dst_node))
+        return path, self.config.rdma_bw_gbps, base_us, link_key
 
     def pipelined_first_chunk_ms(
         self,
@@ -123,9 +198,9 @@ class KVTransferModel:
         Without:         full transfer latency.
         """
         if self.config.pipelining and num_blocks > self.config.pipeline_chunk_blocks:
-            return self.pipelined_first_chunk_ms(
-                block_size, same_rack, src_gpu, dst_gpu
-            )
+            return self.transfer_timing_ms(
+                num_blocks, block_size, same_rack, src_gpu, dst_gpu
+            ).ttft_ms
         return self.transfer_latency_ms(
             num_blocks, block_size, same_rack, src_gpu, dst_gpu
         )

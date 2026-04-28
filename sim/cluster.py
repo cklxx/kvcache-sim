@@ -381,6 +381,7 @@ class Cluster:
         return {r.rack_id: r.eic.utilization for r in self.racks}
 
     def reset_all(self) -> None:
+        self.network.reset()
         for gpu in self.all_gpus:
             gpu.reset_metrics()
 
@@ -476,7 +477,6 @@ def build_cluster(
     ``simulate_gpus_per_rack``.
     """
     cc = cfg.get("cluster", {})
-    net_cfg = cc.get("network", {})
     gpu_cfg = cc.get("gpu", {})
     eic_cfg = cc.get("eic", {})
 
@@ -484,11 +484,7 @@ def build_cluster(
     n_gpus = cc.get("simulate_gpus_per_rack", 16)
     eic_nodes = eic_cfg.get("nodes_per_rack", 4)
 
-    network = NetworkModel(
-        intra_rack_us=net_cfg.get("intra_rack_latency_us", 3.0),
-        cross_rack_us=net_cfg.get("cross_rack_latency_us", 15.0),
-        remote_ssd_us=net_cfg.get("remote_ssd_latency_us", 200.0),
-    )
+    network = NetworkModel.from_config(cfg)
 
     racks: List[Rack] = []
     gid = 0

@@ -288,14 +288,16 @@ class PDOrchestrator:
             total_bytes=prefill_result.kv_bytes,
             sequence_id=event.sequence_id,
         )
-        full_transfer_ms = self.transfer_model.transfer_latency_ms(
-            len(prefill_result.block_hashes), request.block_size, same_rack,
-            src_gpu=p_node.gpu_id, dst_gpu=d_node.gpu_id,
+        transfer_timing = self.transfer_model.transfer_timing_ms(
+            len(prefill_result.block_hashes),
+            request.block_size,
+            same_rack,
+            src_gpu=p_node.gpu_id,
+            dst_gpu=d_node.gpu_id,
+            start_time_ms=event.prefill_done_time,
         )
-        ttft_transfer_ms = self.transfer_model.effective_ttft_transfer_ms(
-            len(prefill_result.block_hashes), request.block_size, same_rack,
-            src_gpu=p_node.gpu_id, dst_gpu=d_node.gpu_id,
-        )
+        full_transfer_ms = transfer_timing.full_ms
+        ttft_transfer_ms = transfer_timing.ttft_ms
 
         return (
             PDPendingDecode(

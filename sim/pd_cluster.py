@@ -90,6 +90,7 @@ class PDCluster:
         return len(self.racks)
 
     def reset_all(self) -> None:
+        self.network.reset()
         for n in self.prefill_nodes:
             n.reset_metrics()
             n.queue_depth = 0
@@ -151,7 +152,6 @@ def build_pd_cluster(
         pd_config = PDConfig.from_config(cfg)
 
     cc = cfg.get("cluster", {})
-    net_cfg = cc.get("network", {})
     gpu_cfg = cc.get("gpu", {})
     eic_cfg = cc.get("eic", {})
 
@@ -159,16 +159,7 @@ def build_pd_cluster(
     n_gpus_per_rack = cc.get("simulate_gpus_per_rack", 16)
     eic_nodes = eic_cfg.get("nodes_per_rack", 4)
 
-    network = NetworkModel(
-        intra_rack_us=net_cfg.get("intra_rack_latency_us", 3.0),
-        cross_rack_us=net_cfg.get("cross_rack_latency_us", 15.0),
-        remote_ssd_us=net_cfg.get("remote_ssd_latency_us", 200.0),
-        p2p_rdma_bw_gbps=net_cfg.get("p2p_rdma_bw_gbps", 100.0),
-        p2p_rdma_latency_us=net_cfg.get("p2p_rdma_latency_us", 5.0),
-        nvlink_bw_gbps=net_cfg.get("nvlink_bw_gbps", 900.0),
-        nvlink_latency_us=net_cfg.get("nvlink_latency_us", 1.0),
-        gpus_per_node=net_cfg.get("gpus_per_node", 8),
-    )
+    network = NetworkModel.from_config(cfg)
 
     # Compute P:D split per rack
     p_ratio, d_ratio = pd_config.pd_ratio

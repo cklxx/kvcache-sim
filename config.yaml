@@ -72,6 +72,11 @@ cluster:
     nvlink_bw_gbps: 900         # NVLink 4.0 (H100 SXM, effective GB/s)
     nvlink_latency_us: 1        # intra-node GPU-to-GPU
     gpus_per_node: 8            # 8 GPUs per NVLink mesh
+    jitter_cv: 0.0              # coefficient of variation for network latency/bw noise
+    tail_jitter_prob: 0.0       # rare slow-transfer probability
+    tail_jitter_multiplier: 1.0 # multiplier when tail jitter triggers
+    contention_enabled: false   # serialize concurrent transfers sharing a link
+    seed: 42
 
 # ── Trace ────────────────────────────────────────────────────────────
 
