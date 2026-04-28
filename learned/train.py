@@ -10,13 +10,9 @@ Usage
 """
 from __future__ import annotations
 
-import math
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
-import numpy as np
-
-from learned.features import extract_features
 from trace.generator import Request
 
 
@@ -26,14 +22,18 @@ class ModelTrainer:
         self._events: List[Tuple[str, float, float, float]] = []
         self._access_times: Dict[str, List[float]] = defaultdict(list)
 
-    def collect(self, requests: List[Request]) -> None:
+    def collect(self, requests: List[Request], reset: bool = True) -> None:
         """
         Scan the trace and build (block_hash, time, depth, reuse_dist) records.
         We compute reuse distance as the gap to the next occurrence of the same
-        block hash.
+        block hash within the supplied training slice. Callers should pass only
+        warmup/train requests, not the measured evaluation suffix.
         """
+        if reset:
+            self._events = []
+            self._access_times = defaultdict(list)
+
         # Build next_access map: for each (block_hash, occurrence_idx) → next_time
-        from collections import defaultdict
         occurrences: Dict[str, List[float]] = defaultdict(list)
         for req in requests:
             for depth, bh in enumerate(req.block_hashes):
@@ -42,6 +42,9 @@ class ModelTrainer:
         # Now build training events
         seen: Dict[str, int] = defaultdict(int)  # block_hash → occurrence count so far
         access_so_far: Dict[str, List[float]] = defaultdict(list)
+        if not reset:
+            for bh, times in self._access_times.items():
+                access_so_far[bh] = list(times)
 
         for req in requests:
             for depth, bh in enumerate(req.block_hashes):
@@ -60,7 +63,11 @@ class ModelTrainer:
                 access_so_far[bh].append(current_time)
                 seen[bh] += 1
 
-        self._access_times = dict(access_so_far)
+        self._access_times = {k: list(v) for k, v in access_so_far.items()}
+
+    @property
+    def sample_count(self) -> int:
+        return len(self._events)
 
     def train(self):
         """

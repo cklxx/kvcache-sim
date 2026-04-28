@@ -24,7 +24,7 @@ from .network import NetworkModel
 @dataclass
 class TransferConfig:
     strategy: str = "push"           # "push" | "pull" | "pull_on_demand"
-    rdma_bw_gbps: float = 100.0     # RDMA NIC bandwidth (cross-node)
+    rdma_bw_gbps: float = 12.5      # Effective GB/s; 100 Gbps NIC = 12.5 GB/s
     rdma_latency_us: float = 5.0    # base RDMA round-trip
     pipelining: bool = True          # overlap transfer with decode start
     pipeline_chunk_blocks: int = 16  # send this many blocks per chunk
@@ -35,7 +35,7 @@ class TransferConfig:
         tc = cfg.get("pd_separation", {}).get("transfer", {})
         return TransferConfig(
             strategy=tc.get("strategy", "push"),
-            rdma_bw_gbps=tc.get("rdma_bw_gbps", 100.0),
+            rdma_bw_gbps=tc.get("rdma_bw_gbps", 12.5),
             rdma_latency_us=tc.get("rdma_latency_us", 5.0),
             pipelining=tc.get("pipelining", True),
             pipeline_chunk_blocks=tc.get("pipeline_chunk_blocks", 16),
@@ -69,7 +69,8 @@ class KVTransferModel:
 
         # Pick interconnect based on topology
         same_node = (
-            src_gpu >= 0
+            same_rack
+            and src_gpu >= 0
             and dst_gpu >= 0
             and self.network._same_node(src_gpu, dst_gpu)
         )

@@ -16,6 +16,7 @@ Prefetch
 from __future__ import annotations
 
 import bisect
+import math
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
@@ -188,10 +189,17 @@ class LearnedPolicy(EvictionPolicy):
     def _predict_reuse_distance(self, block_hash: str, current_time: float) -> float:
         if self._model is not None:
             try:
+                if hasattr(self._model, "predict_reuse_distance"):
+                    return float(
+                        self._model.predict_reuse_distance(
+                            block_hash, self._access_times, current_time
+                        )
+                    )
                 from learned.features import extract_features
                 import numpy as np
                 feats = extract_features(block_hash, self._access_times, current_time)
-                return float(self._model.predict(np.array([feats]))[0])
+                log_dist = float(self._model.predict(np.array([feats]))[0])
+                return math.expm1(max(log_dist, 0.0))
             except Exception:
                 pass
         # Fallback: average inter-access interval (larger = less frequent = evict first)
@@ -219,7 +227,8 @@ class LearnedPolicy(EvictionPolicy):
                 feat_rows = [extract_features(h, self._access_times, current_time) for h in keys]
                 X = pd.DataFrame(feat_rows, columns=[f"f{i}" for i in range(len(feat_rows[0]))])
                 preds = self._model.predict(X)
-                return keys[int(np.argmax(preds))]
+                scores = np.expm1(np.maximum(preds, 0.0))
+                return keys[int(np.argmax(scores))]
             except Exception:
                 pass
         return max(keys, key=lambda h: self._predict_reuse_distance(h, current_time))
@@ -464,8 +473,8 @@ class NoPrefetch(PrefetchPolicy):
 
 class SessionAwarePrefetch(PrefetchPolicy):
     """
-    Records per-session block sequences and predicts upcoming blocks
-    by matching the current block against recent patterns.
+    Records completed per-session block sequences and predicts upcoming blocks
+    by matching the current block against recent past patterns.
     """
 
     def __init__(self, window: int = 3, lookahead: int = 2) -> None:
@@ -474,8 +483,10 @@ class SessionAwarePrefetch(PrefetchPolicy):
         self._lookahead = lookahead
 
     def record_sequence(self, session_id: str, block_hashes: List[str]) -> None:
+        if not block_hashes:
+            return
         seqs = self._patterns.setdefault(session_id, [])
-        seqs.append(block_hashes)
+        seqs.append(list(block_hashes))
         if len(seqs) > 10:
             seqs.pop(0)
 

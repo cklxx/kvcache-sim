@@ -27,12 +27,13 @@ class ClusterReplayer:
         self.verbose = verbose
 
     def run(self, requests: List[Request]) -> Metrics:
-        # Seed Belady oracles and session-aware prefetch on all GPUs
+        warmup_count = min(max(self.warmup_count, 0), len(requests))
+
+        # Seed only explicit offline oracles. Session-aware prefetchers learn
+        # online after a GPU has processed each request.
         for gpu in self.cluster.all_gpus:
             if isinstance(gpu.eviction, BeladyOracle):
                 _seed_belady(gpu.eviction, requests)
-            if isinstance(gpu.prefetch, SessionAwarePrefetch):
-                _seed_session_patterns(gpu.prefetch, requests)
 
         self.cluster.reset_all()
 
@@ -45,10 +46,13 @@ class ClusterReplayer:
                 req.timestamp,
             )
 
-            if i == self.warmup_count - 1:
+            if isinstance(gpu.prefetch, SessionAwarePrefetch):
+                gpu.prefetch.record_sequence(req.session_id, req.block_hashes)
+
+            if i == warmup_count - 1:
                 self.cluster.reset_all()
 
-            if self.verbose and i >= self.warmup_count and i % 2000 == 0:
+            if self.verbose and i >= warmup_count and i % 2000 == 0:
                 m = self.cluster.aggregate_metrics()
                 print(
                     f"    [{i}/{len(requests)}] hit={m.hit_rate:.2%} "
@@ -59,16 +63,6 @@ class ClusterReplayer:
 
 
 # ── helpers ───────────────────────────────────────────────────────────
-
-
-def _seed_session_patterns(policy: SessionAwarePrefetch, requests: List[Request]) -> None:
-    from collections import defaultdict
-    sessions: dict = defaultdict(list)
-    for req in requests:
-        sessions[req.session_id].append(req.block_hashes)
-    for sid, seqs in sessions.items():
-        for seq in seqs[:-1]:
-            policy.record_sequence(sid, seq)
 
 
 def _seed_belady(policy: BeladyOracle, requests: List[Request]) -> None:

@@ -21,6 +21,7 @@ from .kv_transfer import KVTransferModel
 from .pd_nodes import (
     ComputeConfig,
     DecodeNode,
+    DecodeSequence,
     KVTransferInfo,
     PDRequest,
     PrefillNode,
@@ -152,6 +153,39 @@ class DecodeRouter:
 # ======================================================================
 
 
+@dataclass
+class PDPrefillEvent:
+    """A request whose prefill phase has been scheduled/computed."""
+
+    request_index: int
+    request: PDRequest
+    sequence_id: str
+    prefill_node: PrefillNode
+    prefill_result: PrefillResult
+    arrival_time: float
+    prefill_done_time: float
+    max_output_tokens: int
+
+
+@dataclass
+class PDPendingDecode:
+    """A prefilled request waiting for decode admission."""
+
+    request_index: int
+    request: PDRequest
+    sequence_id: str
+    prefill_node: PrefillNode
+    decode_node: DecodeNode
+    prefill_result: PrefillResult
+    transfer_info: KVTransferInfo
+    same_rack: bool
+    prefill_done_time: float
+    decode_ready_time: float
+    kv_transfer_ms: float
+    ttft_transfer_ms: float
+    max_output_tokens: int
+
+
 class PDOrchestrator:
     """
     Coordinates the full Prefill → Transfer → Decode pipeline.
@@ -178,30 +212,65 @@ class PDOrchestrator:
         self.transfer_model = transfer_model
         self.compute_cfg = compute_cfg
         self.max_output_tokens = max_output_tokens
+        self._active_decodes: Dict[str, PDPendingDecode] = {}
 
-    def process_request(
+    def reset(self) -> None:
+        """Clear orchestrator-owned decode bookkeeping."""
+        self._active_decodes.clear()
+
+    def _sequence_id(self, request: PDRequest) -> str:
+        return f"{request.session_id}:{request.turn_id}"
+
+    def prepare_prefill(
         self,
         request: PDRequest,
         current_time: float,
-    ) -> "PDStepResult":
-        """Full PD pipeline for one request."""
+        request_index: int = -1,
+    ) -> PDPrefillEvent:
+        """Route and execute the prefill phase, returning a timed event."""
         max_out = request.max_output_tokens or self.max_output_tokens
 
-        # ── 1. Route to prefill node ──
         p_node = self.prefill_router.route(request, current_time)
         p_node.queue_depth += 1
 
-        # ── 2. Prefill ──
         prefill_result = p_node.prefill(request, current_time)
-        queue_wait_ms = prefill_result.queue_wait_ms
-        prefill_done_time = current_time + queue_wait_ms + prefill_result.compute_time_ms
+        prefill_done_time = (
+            current_time
+            + prefill_result.queue_wait_ms
+            + prefill_result.compute_time_ms
+        )
         p_node.queue_depth -= 1
 
-        # ── 3. Route to decode node ──
+        return PDPrefillEvent(
+            request_index=request_index,
+            request=request,
+            sequence_id=self._sequence_id(request),
+            prefill_node=p_node,
+            prefill_result=prefill_result,
+            arrival_time=current_time,
+            prefill_done_time=prefill_done_time,
+            max_output_tokens=max_out,
+        )
+
+    def start_decode_transfer(
+        self,
+        event: PDPrefillEvent,
+    ) -> Tuple[PDPendingDecode, List["PDStepResult"]]:
+        """
+        Route to a decode node at prefill completion time and schedule KV transfer.
+
+        Decode nodes are advanced to ``prefill_done_time`` before routing so
+        the router sees active sequences that are valid on the event timeline.
+        """
+        completed = self.advance_decode_nodes(event.prefill_done_time)
+
+        p_node = event.prefill_node
+        prefill_result = event.prefill_result
+        request = event.request
+
         d_node = self.decode_router.route(prefill_result)
         same_rack = p_node.rack_id == d_node.rack_id
 
-        # ── 4. KV Transfer ──
         transfer_info = KVTransferInfo(
             source_node_id=p_node.gpu_id,
             dest_node_id=d_node.gpu_id,
@@ -210,6 +279,7 @@ class PDOrchestrator:
             session_id=request.session_id,
             block_hashes=prefill_result.block_hashes,
             total_bytes=prefill_result.kv_bytes,
+            sequence_id=event.sequence_id,
         )
         full_transfer_ms = self.transfer_model.transfer_latency_ms(
             len(prefill_result.block_hashes), request.block_size, same_rack,
@@ -220,45 +290,131 @@ class PDOrchestrator:
             src_gpu=p_node.gpu_id, dst_gpu=d_node.gpu_id,
         )
 
-        # ── 5. Decode receives KV ──
-        decode_start_time = prefill_done_time + ttft_transfer_ms
-        d_node.receive_kv(transfer_info, request.block_size, decode_start_time)
+        return (
+            PDPendingDecode(
+                request_index=event.request_index,
+                request=request,
+                sequence_id=event.sequence_id,
+                prefill_node=p_node,
+                decode_node=d_node,
+                prefill_result=prefill_result,
+                transfer_info=transfer_info,
+                same_rack=same_rack,
+                prefill_done_time=event.prefill_done_time,
+                decode_ready_time=event.prefill_done_time + ttft_transfer_ms,
+                kv_transfer_ms=full_transfer_ms,
+                ttft_transfer_ms=ttft_transfer_ms,
+                max_output_tokens=event.max_output_tokens,
+            ),
+            completed,
+        )
 
-        # ── 6. Decode steps (continuous batching) ──
-        # First token: step time depends on concurrent active sequences
-        first_decode_ms = d_node.decode_step(request.session_id, decode_start_time)
-        # Remaining tokens: same decode node, concurrent sequence count may vary
-        # Use current active count as representative
-        step_ms = self.compute_cfg.decode_step_ms(d_node.active_count)
-        remaining_decode_ms = (max_out - 1) * step_ms
-        decode_total_ms = first_decode_ms + remaining_decode_ms
+    def admit_decode(self, pending: PDPendingDecode) -> List["PDStepResult"]:
+        """Admit a decode-ready request and return any completed results."""
+        self._active_decodes[pending.sequence_id] = pending
+        completed_sequences = pending.decode_node.admit_sequence(
+            transfer=pending.transfer_info,
+            block_size=pending.request.block_size,
+            ready_time=pending.decode_ready_time,
+            max_tokens=pending.max_output_tokens,
+        )
+        return self._complete_sequences(completed_sequences)
 
-        # Finish sequence and release refs
-        d_node.finish_sequence(request.session_id)
-        p_node.release_sequence(prefill_result.block_hashes)
+    def advance_decode_nodes(self, current_time: float) -> List["PDStepResult"]:
+        """Advance every decode node to ``current_time`` and collect completions."""
+        completed_sequences: List[DecodeSequence] = []
+        for node in self.decode_router.decode_nodes:
+            completed_sequences.extend(node.advance_time(current_time))
+        return self._complete_sequences(completed_sequences)
 
-        # ── 7. Compute TTFT and E2E ──
-        ttft_ms = queue_wait_ms + prefill_result.compute_time_ms + ttft_transfer_ms + first_decode_ms
-        e2e_ms = ttft_ms + remaining_decode_ms
+    def drain_decode(self) -> List["PDStepResult"]:
+        """Run all decode nodes until their active sequences complete."""
+        completed_sequences: List[DecodeSequence] = []
+        for node in self.decode_router.decode_nodes:
+            completed_sequences.extend(node.drain())
+        return self._complete_sequences(completed_sequences)
 
+    def _complete_sequences(
+        self,
+        sequences: List[DecodeSequence],
+    ) -> List["PDStepResult"]:
+        results: List[PDStepResult] = []
+        for seq in sequences:
+            sequence_id = seq.sequence_id or seq.session_id
+            pending = self._active_decodes.pop(sequence_id, None)
+            if pending is None:
+                continue
+            pending.prefill_node.release_sequence(
+                pending.prefill_result.block_hashes
+            )
+            results.append(self._result_from_completion(pending, seq))
+        return results
+
+    def _result_from_completion(
+        self,
+        pending: PDPendingDecode,
+        seq: DecodeSequence,
+    ) -> "PDStepResult":
+        first_token_time = (
+            seq.first_token_time
+            if seq.first_token_time is not None
+            else seq.finish_time
+            if seq.finish_time is not None
+            else seq.start_time
+        )
+        decode_finish_time = (
+            seq.finish_time if seq.finish_time is not None else first_token_time
+        )
+        transfer_done_time = pending.prefill_done_time + pending.kv_transfer_ms
+        request_finish_time = max(decode_finish_time, transfer_done_time)
+
+        prefill_result = pending.prefill_result
         return PDStepResult(
-            session_id=request.session_id,
-            prefill_node_id=p_node.gpu_id,
-            decode_node_id=d_node.gpu_id,
-            same_rack=same_rack,
-            prefill_queue_wait_ms=queue_wait_ms,
+            session_id=pending.request.session_id,
+            prefill_node_id=pending.prefill_node.gpu_id,
+            decode_node_id=pending.decode_node.gpu_id,
+            same_rack=pending.same_rack,
+            prefill_queue_wait_ms=prefill_result.queue_wait_ms,
             prefill_compute_ms=prefill_result.compute_time_ms,
-            kv_transfer_ms=full_transfer_ms,
-            ttft_transfer_ms=ttft_transfer_ms,
-            decode_first_token_ms=first_decode_ms,
-            decode_total_ms=decode_total_ms,
-            ttft_ms=ttft_ms,
-            e2e_ms=e2e_ms,
+            kv_transfer_ms=pending.kv_transfer_ms,
+            ttft_transfer_ms=pending.ttft_transfer_ms,
+            decode_first_token_ms=max(0.0, first_token_time - seq.start_time),
+            decode_total_ms=max(0.0, decode_finish_time - seq.start_time),
+            ttft_ms=max(0.0, first_token_time - pending.request.timestamp),
+            e2e_ms=max(0.0, request_finish_time - pending.request.timestamp),
             prefix_hit_blocks=prefill_result.cached_blocks,
             new_computed_blocks=prefill_result.new_blocks,
             kv_bytes_transferred=prefill_result.kv_bytes,
-            output_tokens=max_out,
+            output_tokens=pending.max_output_tokens,
+            request_index=pending.request_index,
+            decode_queue_wait_ms=max(0.0, seq.start_time - pending.decode_ready_time),
+            decode_start_time=seq.start_time,
+            decode_first_token_time=first_token_time,
+            decode_finish_time=decode_finish_time,
+            decode_ready_time=pending.decode_ready_time,
         )
+
+    def process_request(
+        self,
+        request: PDRequest,
+        current_time: float,
+    ) -> "PDStepResult":
+        """
+        Full PD pipeline for one request.
+
+        The replay path uses the event-oriented methods above.  This helper is
+        kept for compatibility and drains decode work until this request has a
+        completed result.
+        """
+        event = self.prepare_prefill(request, current_time)
+        pending, completed = self.start_decode_transfer(event)
+        completed.extend(self.admit_decode(pending))
+        completed.extend(self.drain_decode())
+
+        for result in completed:
+            if result.session_id == request.session_id:
+                return result
+        raise RuntimeError(f"PD request did not complete: {request.session_id}")
 
 
 @dataclass
@@ -285,3 +441,11 @@ class PDStepResult:
     new_computed_blocks: int
     kv_bytes_transferred: int
     output_tokens: int
+
+    # Event-driven decode timeline (optional for existing metrics)
+    request_index: int = -1
+    decode_queue_wait_ms: float = 0.0
+    decode_start_time: float = 0.0
+    decode_first_token_time: float = 0.0
+    decode_finish_time: float = 0.0
+    decode_ready_time: float = 0.0

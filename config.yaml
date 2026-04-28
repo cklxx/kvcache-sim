@@ -1,19 +1,19 @@
 # ──────────────────────────────────────────────────────────────────────
 # kvcache-sim configuration
 #
-# All sizes are REAL hardware values (H100 80GB + Llama-3-8B).
+# Sizes model a 70B deployment profile on H100-class GPUs.
 # The simulator only tracks metadata — no real memory is allocated,
 # so using full-size values is both accurate and tractable.
 #
-# Reference: H100 80GB SXM
-#   HBM capacity: 80 GB, model weights ~14 GB → ~60 GB KV budget
+# Reference: H100 80GB SXM / 70B serving profile
+#   HBM capacity: 80 GB, simulated KV budget: 5 GB per GPU
 #   HBM bandwidth: 3350 GB/s
 #   FP16 tensor: 989 TFLOPS (peak), ~800 effective
 #
-# Reference: Llama-3-8B (GQA, 8 KV heads, 32 layers, head_dim=128)
-#   KV per token: 2 × 128 × 8 × 2B × 32L = 131,072 B = 128 KB
-#   vLLM block: 16 tokens → 2 MB per block
-#   HBM budget: 60 GB → ~30,000 blocks
+# Reference: Llama-3-70B (GQA, 8 KV heads, 80 layers, head_dim=128)
+#   KV per token: 2 × 8 × 128 × 2B × 80L = 327,680 B = 320 KiB
+#   vLLM block: 16 tokens → 5 MiB per block
+#   HBM budget: 5 GB → ~953 blocks
 # ──────────────────────────────────────────────────────────────────────
 
 # ── Single-node mode (python main.py) ────────────────────────────────
@@ -36,7 +36,7 @@ hardware:
     read_latency_ms: 0.5        # ~500 μs
 
 cache:
-  block_size_bytes: 10485760    # 10 MB = 16 tokens × 640 KB/token (70B vLLM page)
+  block_size_bytes: 5242880     # 5 MiB = 16 tokens × 320 KiB/token (70B vLLM page)
   num_workers: 4
   promote_on_hit: true
   async_backup: true
@@ -69,7 +69,7 @@ cluster:
     intra_rack_latency_us: 3    # GPU ↔ EIC same rack (RDMA)
     cross_rack_latency_us: 15   # spine fabric
     remote_ssd_latency_us: 200  # disaggregated NVMe-oF
-    nvlink_bw_gbps: 900         # NVLink 4.0 (H100 SXM, bidirectional)
+    nvlink_bw_gbps: 900         # NVLink 4.0 (H100 SXM, effective GB/s)
     nvlink_latency_us: 1        # intra-node GPU-to-GPU
     gpus_per_node: 8            # 8 GPUs per NVLink mesh
 
@@ -135,7 +135,7 @@ pd_separation:
     prefill_tflops: 800          # H100 FP16 effective TFLOPS
     decode_memory_bw_gbps: 3350  # H100 HBM bandwidth
     model_params_b: 70           # Llama-3-70B
-    kv_bytes_per_token: 655360   # 640 KB (2 × 128 × 80heads × 2B × 80L / 8 GQA)
+    kv_bytes_per_token: 327680   # 320 KiB (2 × 8 KV heads × 128 × 2B × 80L)
     tokens_per_block: 16         # vLLM default page size
     overhead_factor: 1.0         # 70B: prefill ~0.35ms/tok, decode ~83.6ms/tok
     prefill_batch_efficiency: 0.85
@@ -143,7 +143,7 @@ pd_separation:
 
   transfer:
     strategy: push               # push | pull | pull_on_demand
-    rdma_bw_gbps: 100            # RDMA NIC bandwidth
+    rdma_bw_gbps: 12.5           # Effective GB/s; 100 Gbps RDMA NIC = 12.5 GB/s
     rdma_latency_us: 5           # base RDMA latency
     pipelining: true
     pipeline_chunk_blocks: 16

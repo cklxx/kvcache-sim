@@ -32,11 +32,11 @@ class TraceReplayer:
         Replay all requests through the router.
         Requests before warmup_count populate caches but metrics are discarded.
         """
-        # Seed policies on all workers
+        warmup_count = min(max(self.warmup_count, 0), len(requests))
+
+        # Seed only explicit offline oracles. SessionAwarePrefetch learns
+        # online below after each request has completed.
         for w in self.router.workers:
-            prefetch = w.cache.prefetch
-            if isinstance(prefetch, SessionAwarePrefetch):
-                _seed_session_patterns(prefetch, requests)
             if isinstance(w.cache.eviction, BeladyOracle):
                 _seed_belady(w.cache.eviction, requests)
 
@@ -45,7 +45,7 @@ class TraceReplayer:
             w.cache.reset_metrics()
 
         for i, req in enumerate(requests):
-            is_warmup = i < self.warmup_count
+            is_warmup = i < warmup_count
 
             # Route to best worker
             worker = self.router.route(req.block_hashes)
@@ -56,7 +56,11 @@ class TraceReplayer:
                 req.timestamp,
             )
 
-            if is_warmup and i == self.warmup_count - 1:
+            prefetch = worker.cache.prefetch
+            if isinstance(prefetch, SessionAwarePrefetch):
+                prefetch.record_sequence(req.session_id, req.block_hashes)
+
+            if is_warmup and i == warmup_count - 1:
                 # Reset metrics after warmup completes
                 for w in self.router.workers:
                     w.cache.reset_metrics()
@@ -72,17 +76,6 @@ class TraceReplayer:
 # ======================================================================
 # Helpers
 # ======================================================================
-
-
-def _seed_session_patterns(policy: SessionAwarePrefetch, requests: List[Request]) -> None:
-    """Pre-feed all session block sequences so the policy can learn them."""
-    from collections import defaultdict
-    sessions: dict = defaultdict(list)
-    for req in requests:
-        sessions[req.session_id].append(req.block_hashes)
-    for sid, seqs in sessions.items():
-        for seq in seqs[:-1]:
-            policy.record_sequence(sid, seq)
 
 
 def _seed_belady(policy: BeladyOracle, requests: List[Request]) -> None:

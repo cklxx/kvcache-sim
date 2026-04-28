@@ -60,7 +60,7 @@ Three simulation modes:
   │                                 │ SessionAware prefetch          │
   │                                 ▼                                │
   │                          KV Transfer (RDMA push)                 │
-  │                          0.01ms @ 100 Gbps                      │
+  │                          pipelined first-chunk latency           │
   │                                 │                                │
   │              DecodeRouter ◀─────┘                                │
   │              (same-rack pref    │                                │
@@ -142,7 +142,7 @@ kvcache-sim/
 
 ### Why PD Separation?
 
-In **unified** serving, a GPU does prefill (process prompt) then decode (generate tokens) sequentially. The decode phase (128 tokens × 8.75ms = 1.12s for 7B) **blocks** the GPU from accepting new prefill requests — this is head-of-line blocking.
+In **unified** serving, a GPU does prefill (process prompt) then decode (generate tokens) sequentially. With the default 70B profile, the decode phase (128 tokens × ~83.6ms) can occupy a GPU for ~10.7s, blocking new prefill work — this is head-of-line blocking.
 
 **PD separation** dedicates GPUs to each phase:
 - **Prefill nodes**: Compute-bound, process prompts, free immediately after
@@ -160,19 +160,19 @@ In **unified** serving, a GPU does prefill (process prompt) then decode (generat
 | **PrefillRouter** | Prefix cache hit scoring + queue-aware load balancing |
 | **DecodeRouter** | Same-rack preference (fast transfer) + capacity-aware |
 
-### Compute Model (H100, 7B)
+### Compute Model (H100, 70B default profile)
 
 | Phase | Formula | Value |
 |-------|---------|-------|
-| Prefill | `2 × params / TFLOPS` | 0.035 ms/token |
-| Decode | `2 × params / HBM_BW` | 8.75 ms/token |
-| Decode (64 seq batch) | base + marginal KV overhead | ~9.8 ms/step |
-| KV transfer (1K tokens) | `bytes / RDMA_BW` | 0.005 ms |
-| KV transfer (128K tokens) | `bytes / RDMA_BW` | 0.65 ms |
+| Prefill | `2 × params / TFLOPS` | ~0.35 ms/token |
+| Decode | `2 × params / HBM_BW` | ~83.6 ms/token |
+| Decode (64 seq batch) | base + marginal KV overhead | ~93.6 ms/step |
+| KV transfer first chunk | `16 blocks × 5 MiB / 12.5 GB/s` | ~6.7 ms |
+| KV transfer full 8K prompt | `512 blocks × 5 MiB / 12.5 GB/s` | ~215 ms |
 
 ---
 
-## PD Separation: Example Results
+## PD Separation: Example Output
 
 ```
 ================================================================
@@ -180,32 +180,15 @@ In **unified** serving, a GPU does prefill (process prompt) then decode (generat
   PDCluster: 128 GPUs (32P + 96D, ratio 1:3) × 8 racks
 ================================================================
 
-Unified vs PD-Separated:
-╭──────────────┬──────────┬──────────┬──────────┬──────────┬───────────╮
-│ Config       │ TTFT_p50 │ TPOT_avg │ Prefill  │ Transfer │ QueueWait │
-├──────────────┼──────────┼──────────┼──────────┼──────────┼───────────┤
-│ Unified      │ 15840 ms │   8.8 ms │  12.7 ms │     0 ms │  15353 ms │
-│ PD Separated │   847 ms │   8.9 ms │  12.6 ms │  0.01 ms │    853 ms │
-╰──────────────┴──────────┴──────────┴──────────┴──────────┴───────────╯
+The exact numbers are workload-dependent. The PD replayer now keeps decode
+sequences active across requests, so TTFT/TPOT reflect queueing, decode overlap,
+P:D ratio, prompt length, output length, and KV transfer settings.
 
-  PD separation: 18.7× lower TTFT
-  Root cause: Unified GPU blocked by decode (128 × 8.75ms = 1120ms per request)
-  Transfer overhead: 0.01ms — negligible at 100 Gbps RDMA
-
-P:D Ratio Sweep:
-╭──────────┬──────────┬───────────┬───────────╮
-│ P:D      │ TTFT_p50 │ PrefixHit │ SameRack  │
-├──────────┼──────────┼───────────┼───────────┤
-│ 1:1      │   427 ms │    65.3%  │     92%   │
-│ 1:2      │   701 ms │    60.8%  │     80%   │
-│ 1:3      │   853 ms │    66.7%  │     97%   │
-│ 1:4      │  1258 ms │    52.4%  │     59%   │
-│ 1:7      │  2302 ms │    34.6%  │     32%   │
-╰──────────┴──────────┴───────────┴───────────╯
-
-  Fewer prefill nodes → higher TTFT (queue buildup)
-  Fewer prefill nodes → lower prefix cache hit (less cache capacity)
-  Fewer prefill nodes → more cross-rack transfers (fewer co-located P-D pairs)
+Key interpretation:
+- Unified serving blocks a GPU for prefill plus the full decode phase.
+- PD serving frees prefill GPUs after prefill, then admits transferred KV into decode nodes.
+- Transfer reports both full KV movement and pipelined first-chunk latency for TTFT.
+- P:D sweeps are meaningful only for the configured workload and hardware profile.
 ```
 
 ---
@@ -233,12 +216,14 @@ pd_separation:
   compute:
     prefill_tflops: 800          # H100 FP16 effective TFLOPS
     decode_memory_bw_gbps: 3200  # H100 HBM bandwidth
-    model_params_b: 7            # Model size (billions)
+    model_params_b: 70           # Model size (billions)
+    kv_bytes_per_token: 327680   # 320 KiB for Llama-3-70B GQA
+    tokens_per_block: 16
     prefill_batch_efficiency: 0.85
     decode_kv_overhead_factor: 0.02
   transfer:
     strategy: push               # push | pull | pull_on_demand
-    rdma_bw_gbps: 100
+    rdma_bw_gbps: 12.5           # effective GB/s for 100 Gbps RDMA
     pipelining: true
 ```
 

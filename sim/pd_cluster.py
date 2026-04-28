@@ -123,7 +123,7 @@ class PDCluster:
             f"  Compute: prefill={self.pd_config.compute.prefill_ms_per_token:.3f} ms/tok, "
             f"decode={self.pd_config.compute.decode_ms_per_token:.3f} ms/tok\n"
             f"  Transfer: {self.pd_config.transfer.strategy}, "
-            f"BW={self.pd_config.transfer.rdma_bw_gbps} Gbps, "
+            f"BW={self.pd_config.transfer.rdma_bw_gbps} GB/s, "
             f"pipeline={'on' if self.pd_config.transfer.pipelining else 'off'}"
         )
 

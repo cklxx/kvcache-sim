@@ -13,10 +13,10 @@ DecodeNode
   - Models decode time: memory-bandwidth bound with marginal KV read overhead
   - Step time scales sub-linearly with concurrent sequences
 
-Compute calibration (H100, 7B model)
+Compute calibration (H100-class GPU, 70B profile from config.yaml)
 -------------------------------------
-  Prefill  : ~0.035 ms/token  (2 × 14 GB / 800 TFLOPS)
-  Decode   : ~8.75 ms/token   (2 × 14 GB / 3200 GB/s)
+  Prefill  : ~0.35 ms/token  (2 × 140 GB / 800 TFLOPS)
+  Decode   : ~83.6 ms/token  (2 × 140 GB / 3350 GB/s)
 """
 from __future__ import annotations
 
@@ -49,9 +49,9 @@ class ComputeConfig:
 
     prefill_tflops: float = 800.0        # H100 FP16 effective
     decode_memory_bw_gbps: float = 3200  # HBM bandwidth
-    model_params_b: float = 7.0          # 7B parameter model
-    kv_bytes_per_token: int = 64         # per token KV cache size
-    tokens_per_block: int = 32
+    model_params_b: float = 70.0         # 70B parameter model
+    kv_bytes_per_token: int = 327680     # 320 KiB per token for Llama-3-70B GQA
+    tokens_per_block: int = 16
     overhead_factor: float = 1.0         # scheduling + framework overhead
 
     # Continuous batching parameters
@@ -174,6 +174,7 @@ class KVTransferInfo:
     session_id: str
     block_hashes: List[str]
     total_bytes: int
+    sequence_id: str = ""
 
 
 @dataclass
@@ -182,9 +183,13 @@ class DecodeSequence:
 
     session_id: str
     kv_block_hashes: List[str]
+    sequence_id: str = ""
     tokens_generated: int = 0
+    ready_time: float = 0.0
     start_time: float = 0.0
     max_tokens: int = 128
+    first_token_time: Optional[float] = None
+    finish_time: Optional[float] = None
 
 
 # ======================================================================
@@ -294,6 +299,7 @@ class PrefillNode:
                     self.radix_tree.insert_sequence(
                         [bh], block_size, effective_time + eic_fetch_ms
                     )
+                    self.metrics.total_requests += 1
                     self.metrics.record_hit("EIC", eic_fetch_ms)
 
         eic_hits = len(eic_hit_hashes)
@@ -424,7 +430,136 @@ class DecodeNode:
             capacity_bytes=hbm.capacity_bytes,
         )
         self.active_sequences: Dict[str, DecodeSequence] = {}
+        self.timeline_time: float = 0.0
         self.metrics = Metrics(tier_names=["HBM", "EIC", "Remote"])
+
+    def _sequence_key(self, session_id: str) -> str:
+        """Return the active-sequence key for legacy session-only callers."""
+        if session_id in self.active_sequences:
+            return session_id
+        for key, seq in self.active_sequences.items():
+            if seq.session_id == session_id:
+                return key
+        return session_id
+
+    def advance_time(self, target_time: float) -> List[DecodeSequence]:
+        """
+        Advance decode work to ``target_time`` at decode-step boundaries.
+
+        A request that arrives in the middle of an in-flight decode step
+        cannot join that step.  Therefore this method only completes steps
+        whose end time is <= ``target_time``; admission uses
+        ``_advance_to_admission_boundary`` to roll through the crossing step
+        for the selected node.
+        """
+        completed: List[DecodeSequence] = []
+        if target_time < self.timeline_time:
+            return completed
+
+        while self.active_sequences:
+            step_ms = self.compute_cfg.decode_step_ms(len(self.active_sequences))
+            if self.timeline_time + step_ms > target_time:
+                break
+            completed.extend(self._run_one_decode_step())
+
+        if not self.active_sequences and self.timeline_time < target_time:
+            self.timeline_time = target_time
+        return completed
+
+    def _advance_to_admission_boundary(self, ready_time: float) -> List[DecodeSequence]:
+        """Advance until a new sequence can join the next decode step."""
+        completed = self.advance_time(ready_time)
+
+        # If ready_time lands inside an in-flight step, finish that step first.
+        if self.active_sequences and self.timeline_time < ready_time:
+            completed.extend(self._run_one_decode_step())
+
+        if not self.active_sequences and self.timeline_time < ready_time:
+            self.timeline_time = ready_time
+        return completed
+
+    def _run_one_decode_step(self) -> List[DecodeSequence]:
+        """Run one continuous-batching decode step for all active sequences."""
+        if not self.active_sequences:
+            return []
+
+        active = len(self.active_sequences)
+        step_ms = self.compute_cfg.decode_step_ms(active)
+        step_end = self.timeline_time + step_ms
+        completed: List[DecodeSequence] = []
+
+        for key, seq in list(self.active_sequences.items()):
+            seq.tokens_generated += 1
+            if seq.tokens_generated == 1:
+                seq.first_token_time = step_end
+            if seq.tokens_generated >= seq.max_tokens:
+                seq.finish_time = step_end
+                completed.append(seq)
+                self.active_sequences.pop(key, None)
+                self.radix_tree.release_sequence(seq.kv_block_hashes)
+
+        self.timeline_time = step_end
+        return completed
+
+    def admit_sequence(
+        self,
+        transfer: KVTransferInfo,
+        block_size: int,
+        ready_time: float,
+        max_tokens: int,
+    ) -> List[DecodeSequence]:
+        """
+        Admit a transferred KV sequence into the decode timeline.
+
+        Returns sequences that completed while advancing this node to the
+        admission point.  The newly admitted sequence completes later via
+        ``advance_time``/``drain`` unless ``max_tokens`` is zero.
+        """
+        completed = self._advance_to_admission_boundary(ready_time)
+
+        while self.active_count >= self.max_concurrent_sequences:
+            completed.extend(self._run_one_decode_step())
+
+        start_time = max(ready_time, self.timeline_time)
+        sequence_id = transfer.sequence_id or transfer.session_id
+
+        if max_tokens <= 0:
+            completed.append(
+                DecodeSequence(
+                    session_id=transfer.session_id,
+                    sequence_id=sequence_id,
+                    kv_block_hashes=list(transfer.block_hashes),
+                    ready_time=ready_time,
+                    start_time=start_time,
+                    max_tokens=0,
+                    first_token_time=start_time,
+                    finish_time=start_time,
+                )
+            )
+            return completed
+
+        self.radix_tree.insert_sequence(
+            transfer.block_hashes, block_size, start_time
+        )
+        self.radix_tree.acquire_sequence(transfer.block_hashes)
+
+        self.active_sequences[sequence_id] = DecodeSequence(
+            session_id=transfer.session_id,
+            sequence_id=sequence_id,
+            kv_block_hashes=list(transfer.block_hashes),
+            tokens_generated=0,
+            ready_time=ready_time,
+            start_time=start_time,
+            max_tokens=max_tokens,
+        )
+        return completed
+
+    def drain(self) -> List[DecodeSequence]:
+        """Run decode until all active sequences complete."""
+        completed: List[DecodeSequence] = []
+        while self.active_sequences:
+            completed.extend(self._run_one_decode_step())
+        return completed
 
     def receive_kv(
         self,
@@ -433,15 +568,11 @@ class DecodeNode:
         current_time: float,
     ) -> None:
         """Receive KV blocks from prefill node and insert into local storage."""
-        self.radix_tree.insert_sequence(
-            transfer.block_hashes, block_size, current_time
-        )
-        self.radix_tree.acquire_sequence(transfer.block_hashes)
-
-        self.active_sequences[transfer.session_id] = DecodeSequence(
-            session_id=transfer.session_id,
-            kv_block_hashes=list(transfer.block_hashes),
-            start_time=current_time,
+        self.admit_sequence(
+            transfer=transfer,
+            block_size=block_size,
+            ready_time=current_time,
+            max_tokens=128,
         )
 
     def decode_step(self, session_id: str, current_time: float) -> float:
@@ -454,18 +585,21 @@ class DecodeNode:
 
         Returns the per-step time (ms).
         """
-        seq = self.active_sequences.get(session_id)
+        self._advance_to_admission_boundary(current_time)
+        key = self._sequence_key(session_id)
+        seq = self.active_sequences.get(key)
         if seq is None:
             return 0.0
 
         # Continuous batching: step time depends on concurrent sequences
         step_ms = self.compute_cfg.decode_step_ms(len(self.active_sequences))
-        seq.tokens_generated += 1
+        self._run_one_decode_step()
         return step_ms
 
     def finish_sequence(self, session_id: str) -> None:
         """Release resources for a completed sequence."""
-        seq = self.active_sequences.pop(session_id, None)
+        key = self._sequence_key(session_id)
+        seq = self.active_sequences.pop(key, None)
         if seq is not None:
             self.radix_tree.release_sequence(seq.kv_block_hashes)
 
@@ -481,4 +615,7 @@ class DecodeNode:
 
     def reset_metrics(self) -> None:
         self.metrics = Metrics(tier_names=["HBM", "EIC", "Remote"])
+        for seq in list(self.active_sequences.values()):
+            self.radix_tree.release_sequence(seq.kv_block_hashes)
         self.active_sequences.clear()
+        self.timeline_time = 0.0

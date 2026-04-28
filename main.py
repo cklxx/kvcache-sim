@@ -91,6 +91,12 @@ def _print_credibility_report(cfg: dict, cluster) -> None:
     eic_nodes = eic_cfg.get("nodes_per_rack", 4)
     gpus_per_rack = cc.get("simulate_gpus_per_rack", 16)
     eic_per_gpu = eic_per_node_gb * eic_nodes / gpus_per_rack
+    block_size_mb = cfg.get("cache", {}).get("block_size_bytes", 4096) / (1024 * 1024)
+    tokens_per_block = (
+        cfg.get("pd_separation", {})
+        .get("compute", {})
+        .get("tokens_per_block", 16)
+    )
 
     print(f"""
   ┌─────────────────────────────────────────────────────────────────┐
@@ -109,8 +115,8 @@ def _print_credibility_report(cfg: dict, cluster) -> None:
   │ HBM KV budget/GPU  │ {hbm_gb * 1024:.0f} MB       │ ~10 GB       │ x{10 / (hbm_gb):.0f} scaled   │
   │ EIC per GPU share   │ {eic_per_gpu * 1024:.0f} MB       │ ~16 GB       │ x{16 / (eic_per_gpu):.0f} scaled   │
   │ EIC : HBM ratio    │ {eic_per_gpu / hbm_gb:.1f}×          │ ~1.6×        │ {"=" if abs(eic_per_gpu / hbm_gb - 1.6) < 0.5 else "~"}            │
-  │ Block size          │ 4 KB         │ 0.3-5 MB     │ scaled       │
-  │ Tokens/block        │ 32           │ 16 (vLLM)    │ ~            │
+  │ Block size          │ {block_size_mb:.1f} MiB      │ 0.3-5 MB     │ =            │
+  │ Tokens/block        │ {tokens_per_block:<12} │ 16 (vLLM)    │ =            │
   ├────────────────────┼──────────────┼──────────────┼──────────────┤
   │ Session routing     │ affinity     │ vLLM affinity│ =            │
   │ Prefix sharing      │ shared sys   │ vLLM radix   │ ~            │
@@ -118,7 +124,7 @@ def _print_credibility_report(cfg: dict, cluster) -> None:
   │ EIC sharing scope   │ per-rack     │ per-rack CXL │ =            │
   └────────────────────┴──────────────┴──────────────┴──────────────┘
 
-  Legend: = exact match  ~ approximate  x{n} absolute capacity scaled {n}×
+  Legend: = exact match  ~ approximate  xN absolute capacity scaled N×
   Note: Absolute capacities are scaled down ~{10 / hbm_gb:.0f}× for tractability.
         Ratios (HBM:EIC, bandwidth hierarchy, latency ordering) are preserved.
         Cache dynamics depend on ratios, not absolute sizes.""")
@@ -130,6 +136,38 @@ def _print_cluster_info(cluster) -> None:
     xgpu = cluster.total_cross_gpu_eic_hits
     print(f"  EIC utilization: {', '.join(f'R{k}={v:.0%}' for k,v in eic_utils.items())}")
     print(f"  Cross-GPU EIC hits (shared prefix reuse): {xgpu}")
+
+
+def _learned_training_plan(cfg: dict, args, num_requests: int, warmup: int) -> tuple[str, int, int]:
+    """
+    Choose the prefix of the trace used to train LearnedPolicy.
+
+    Returns (mode, train_count, eval_warmup). Requests before eval_warmup are
+    excluded from reported metrics, so learned training data is not part of the
+    measured evaluation window.
+    """
+    learned_cfg = cfg.get("learned", {})
+    mode = args.learned_train_mode or learned_cfg.get("train_mode", "warmup")
+    if mode not in {"warmup", "split"}:
+        raise ValueError(f"Unknown learned train mode: {mode}")
+
+    if mode == "warmup":
+        train_count = min(max(int(warmup), 0), num_requests)
+        return mode, train_count, warmup
+
+    fraction = (
+        args.learned_train_fraction
+        if args.learned_train_fraction is not None
+        else learned_cfg.get("train_fraction", 0.2)
+    )
+    fraction = max(0.0, min(float(fraction), 1.0))
+    if num_requests <= 1 or fraction <= 0.0:
+        train_count = 0
+    else:
+        train_count = int(num_requests * fraction)
+        train_count = max(1, min(train_count, num_requests - 1))
+
+    return mode, train_count, max(warmup, train_count)
 
 
 # ======================================================================
@@ -160,25 +198,39 @@ def run_single_node(cfg: dict, args) -> None:
 
     # 3. Learned model
     learned_model = None
+    eval_warmup = warmup
     if not args.no_train:
-        print("[3/5] Training Learned policy model …")
+        mode, train_count, eval_warmup = _learned_training_plan(
+            cfg, args, len(requests), warmup
+        )
+        print(
+            f"[3/5] Training Learned policy model "
+            f"[mode={mode}, train_requests={train_count}, eval_warmup={eval_warmup}] …"
+        )
         from learned.train import ModelTrainer
         from learned.model import LearnedModel
-        trainer = ModelTrainer()
-        trainer.collect(requests)
-        raw = trainer.train()
-        if raw is not None:
-            learned_model = LearnedModel(raw)
-            print("      Model ready.")
+
+        if train_count > 0:
+            learned_cfg = cfg.get("learned", {})
+            trainer = ModelTrainer(
+                min_samples=learned_cfg.get("min_samples", 200)
+            )
+            trainer.collect(requests[:train_count])
+            raw = trainer.train()
+            if raw is not None:
+                learned_model = LearnedModel(raw)
+                print("      Model ready.")
+            else:
+                print("      Skipped (insufficient data).")
         else:
-            print("      Skipped (insufficient data).")
+            print("      Skipped (no training requests outside evaluation window).")
     else:
         print("[3/5] Training skipped.")
 
     # 4. Experiments
     print("[4/5] Running 6 policy configurations …")
     from experiments.run_all import ExperimentRunner
-    runner = ExperimentRunner(cfg, warmup=warmup)
+    runner = ExperimentRunner(cfg, warmup=eval_warmup)
     results = runner.run_all(requests, learned_model=learned_model)
 
     # 5. Results
@@ -324,7 +376,7 @@ def run_pd(cfg: dict, args) -> None:
     _print_pd_table(transfer_results)
 
     # 5. Context Length Sweep (optional, longer)
-    if not args.no_plot:
+    if not args.no_plot and not args.skip_context_sweep:
         print(f"\n[Bonus] Context Length × PD Benefit:")
         ctx_results = runner.run_context_length_pd()
         _print_pd_context_table(ctx_results)
@@ -442,7 +494,11 @@ def run_cluster(cfg: dict, args) -> None:
         turns_per_session=ct.get("turns_per_session", 5),
         prompt_tokens_min=ct.get("prompt_tokens_min", 64),
         prompt_tokens_max=ct.get("prompt_tokens_max", 512),
+        initial_context_tokens=ct.get("initial_context_tokens", 128),
         num_system_prompts=ct.get("num_system_prompts", 20),
+        num_shared_docs=ct.get("num_shared_docs", 0),
+        num_rag_chunks=ct.get("num_rag_chunks", 3),
+        doc_zipf_alpha=ct.get("doc_zipf_alpha", 1.1),
         qps=ct.get("qps", 500.0),
         block_size_bytes=cfg.get("cache", {}).get("block_size_bytes", 4096),
         seed=ct.get("seed", 42),
@@ -456,7 +512,8 @@ def run_cluster(cfg: dict, args) -> None:
     warmup = ce.get("warmup_requests", 1000)
 
     print(f"\n[1/4] Generated {len(requests)} requests ({elapsed:.2f}s)  "
-          f"[sessions={gen.num_sessions}, sys_prompts={gen.num_system_prompts}]")
+          f"[sessions={gen.num_sessions}, sys_prompts={gen.num_system_prompts}, "
+          f"shared_docs={gen.num_shared_docs}]")
 
     # ── 2. EIC sizing experiments ────────────────────────────────────
     print(f"\n[2/4] EIC Sizing Experiments (warmup={warmup}):")
@@ -475,11 +532,15 @@ def run_cluster(cfg: dict, args) -> None:
     _print_table(eviction_results, ["HBM", "EIC", "Remote"])
 
     # ── 4. Context length sweep ────────────────────────────────────
-    print(f"\n[4/5] Context Length Sweep (EIC vs No-EIC):")
-    from experiments.run_all import ClusterContextExperiment
-    ctx_runner = ClusterContextExperiment(cfg)
-    ctx_results = ctx_runner.run()
-    _print_context_table(ctx_results)
+    ctx_results = None
+    if not args.skip_context_sweep:
+        print(f"\n[4/5] Context Length Sweep (EIC vs No-EIC):")
+        from experiments.run_all import ClusterContextExperiment
+        ctx_runner = ClusterContextExperiment(cfg)
+        ctx_results = ctx_runner.run()
+        _print_context_table(ctx_results)
+    else:
+        print(f"\n[4/5] Context Length Sweep skipped (--skip-context-sweep).")
 
     # ── 5. Final cluster stats + credibility report ──────────────────
     print(f"\n[5/5] Final Cluster Topology:")
@@ -500,15 +561,18 @@ def run_cluster(cfg: dict, args) -> None:
             eviction_results, tier_names=["HBM", "EIC", "Remote"],
             output_dir=out_dir, filename="cluster_eviction.png",
         )
-        # Context sweep plot: EIC vs No-EIC hit rates
-        ctx_plot = {
-            k: v["eic"] for k, v in ctx_results.items()
-        }
-        out3 = plot_results(
-            ctx_plot, tier_names=["HBM", "EIC", "Remote"],
-            output_dir=out_dir, filename="cluster_context_sweep.png",
-        )
-        print(f"\nPlots saved → {out1}, {out2}, {out3}")
+        outputs = [out1, out2]
+        if ctx_results is not None:
+            # Context sweep plot: EIC vs No-EIC hit rates
+            ctx_plot = {
+                k: v["eic"] for k, v in ctx_results.items()
+            }
+            out3 = plot_results(
+                ctx_plot, tier_names=["HBM", "EIC", "Remote"],
+                output_dir=out_dir, filename="cluster_context_sweep.png",
+            )
+            outputs.append(out3)
+        print(f"\nPlots saved → {', '.join(outputs)}")
 
     print("\nDone.")
 
@@ -524,8 +588,25 @@ def main() -> None:
     parser.add_argument("--cluster", action="store_true", help="Run 万卡 cluster + EIC mode")
     parser.add_argument("--pd", action="store_true", help="Run PD-separated cluster mode")
     parser.add_argument("--no-train", action="store_true")
+    parser.add_argument(
+        "--learned-train-mode",
+        choices=("warmup", "split"),
+        default=None,
+        help="Train Learned eviction only on warmup requests or on a train/eval prefix split",
+    )
+    parser.add_argument(
+        "--learned-train-fraction",
+        type=float,
+        default=None,
+        help="Fraction of requests used for --learned-train-mode split (default: 0.2)",
+    )
     parser.add_argument("--no-plot", action="store_true")
     parser.add_argument("--show-plot", action="store_true")
+    parser.add_argument(
+        "--skip-context-sweep",
+        action="store_true",
+        help="Skip long context-length sweeps in cluster/PD modes",
+    )
     args = parser.parse_args()
 
     cfg = _load_config(args.config)

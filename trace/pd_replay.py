@@ -7,6 +7,7 @@ via ``earliest_available_time`` per prefill node.
 """
 from __future__ import annotations
 
+import heapq
 from typing import List
 
 from sim.kv_transfer import KVTransferModel
@@ -53,18 +54,55 @@ class PDReplayer:
         are discarded.
         """
         self.cluster.reset_all()
+        self.orchestrator.reset()
         metrics = PDMetrics()
+        prefill_events = []
+        decode_events = []
+
+        def record_completed(results) -> None:
+            for result in results:
+                if result.request_index >= self.warmup_count:
+                    metrics.record_request(result)
+
+        def flush_until(cutoff_time: float) -> None:
+            while prefill_events or decode_events:
+                next_prefill = (
+                    prefill_events[0][0] if prefill_events else float("inf")
+                )
+                next_decode = (
+                    decode_events[0][0] if decode_events else float("inf")
+                )
+                event_time = min(next_prefill, next_decode)
+                if event_time > cutoff_time:
+                    break
+
+                record_completed(self.orchestrator.advance_decode_nodes(event_time))
+
+                while prefill_events and prefill_events[0][0] == event_time:
+                    _, _, event = heapq.heappop(prefill_events)
+                    pending, completed = self.orchestrator.start_decode_transfer(event)
+                    record_completed(completed)
+                    heapq.heappush(
+                        decode_events,
+                        (pending.decode_ready_time, pending.request_index, pending),
+                    )
+
+                while decode_events and decode_events[0][0] == event_time:
+                    _, _, pending = heapq.heappop(decode_events)
+                    record_completed(self.orchestrator.admit_decode(pending))
 
         for i, req in enumerate(requests):
+            flush_until(req.timestamp)
             pd_req = _to_pd_request(req, self.cluster.pd_config.max_output_tokens)
-            result = self.orchestrator.process_request(pd_req, req.timestamp)
-
-            if i >= self.warmup_count:
-                metrics.record_request(result)
-
-            if i == self.warmup_count - 1 and self.warmup_count > 0:
-                # Reset metrics after warmup
-                metrics = PDMetrics()
+            event = self.orchestrator.prepare_prefill(
+                pd_req,
+                req.timestamp,
+                request_index=i,
+            )
+            heapq.heappush(
+                prefill_events,
+                (event.prefill_done_time, i, event),
+            )
 
             if self.verbose and i >= self.warmup_count and i % 1000 == 0:
                 print(
@@ -74,6 +112,12 @@ class PDReplayer:
                     f"reqs={metrics.total_requests}"
                 )
 
+        while prefill_events or decode_events:
+            next_prefill = prefill_events[0][0] if prefill_events else float("inf")
+            next_decode = decode_events[0][0] if decode_events else float("inf")
+            flush_until(min(next_prefill, next_decode))
+
+        record_completed(self.orchestrator.drain_decode())
         return metrics
 
 

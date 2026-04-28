@@ -38,11 +38,11 @@ User Request (prompt: 10K tokens)
 │                                                                     │
 │  ┌─── 3. Prefill Compute ───────────────────────────────┐           │
 │  │  new_tokens = 165 blocks × 16 tok = 2,640 tokens     │           │
-│  │  FLOPs = 2 × 14GB × 2,640 = 73.9 TFLOPS             │           │
-│  │  Time = 73.9T / 800T = 92.4 ms                        │           │
+│  │  FLOPs = 2 × 140GB × 2,640 = 739 TFLOPs              │           │
+│  │  Time = 739T / 800T = 924 ms                          │           │
 │  │                                                       │           │
 │  │  With continuous batching (batch_size=3):              │           │
-│  │  Time = 92.4 × 0.85 = 78.5 ms                        │           │
+│  │  Time = 924 × 0.85 = 785 ms                          │           │
 │  │  (GPU utilisation improves with larger batches)        │           │
 │  └───────────────────────────────────────────────────────┘           │
 │                                                                     │
@@ -64,29 +64,29 @@ User Request (prompt: 10K tokens)
 │  Output: PrefillResult                                              │
 │    - block_hashes: [625 blocks]                                     │
 │    - cached: 460, new: 165                                          │
-│    - compute_time: 78.5 ms                                          │
-│    - kv_bytes: 625 × 2MB = 1,250 MB                                │
+│    - compute_time: 785 ms                                           │
+│    - kv_bytes: 625 × 5MiB = 3,125 MiB                              │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │  KV Transfer (RDMA Push)                                            │
 │                                                                     │
-│  625 blocks × 2 MB = 1,250 MB                                      │
+│  625 blocks × 5 MiB = 3,125 MiB                                    │
 │                                                                     │
 │  Same-rack (intra-rack RDMA):                                       │
 │    base = 3μs (RDMA) + 5μs (latency) = 8μs                        │
-│    transfer = 1,250 MB / 100 Gbps = 100 ms                         │
-│    total = 100.008 ms                                               │
+│    transfer = 3,125 MiB / 12.5 GB/s ≈ 262 ms                       │
+│    total ≈ 262.008 ms                                               │
 │                                                                     │
 │  Cross-rack:                                                        │
 │    base = 15μs + 5μs = 20μs                                        │
-│    transfer = 100 ms (same bandwidth)                               │
-│    total = 100.020 ms                                               │
+│    transfer ≈ 262 ms (same bandwidth)                               │
+│    total ≈ 262.020 ms                                               │
 │                                                                     │
 │  With pipelining (16 blocks per chunk):                             │
-│    first_chunk = 16 × 2MB / 100Gbps = 2.56 ms                     │
-│    → decode can start after 2.56 ms (not 100 ms)                   │
+│    first_chunk = 16 × 5MiB / 12.5GB/s ≈ 6.7 ms                    │
+│    → decode can start after ~6.7 ms (not full transfer)            │
 │    → remaining transfer overlaps with decode                        │
 │                                                                     │
 │  Pull strategy adds +1 RTT (8-20 μs) for request message           │
@@ -116,15 +116,15 @@ User Request (prompt: 10K tokens)
 │  │  N = active_sequences on this GPU (e.g., 32)          │           │
 │  │                                                       │           │
 │  │  Per step: GPU reads ALL model weights once            │           │
-│  │    base = 2 × 14GB / 3350 GB/s = 8.36 ms             │           │
-│  │    kv_overhead = 8.36 × 0.02 × log2(32) = 0.84 ms   │           │
-│  │    step_time = 8.36 + 0.84 = 9.20 ms                 │           │
+│  │    base = 2 × 140GB / 3350 GB/s = 83.6 ms            │           │
+│  │    kv_overhead = 83.6 × 0.02 × log2(32) = 8.36 ms   │           │
+│  │    step_time = 83.6 + 8.36 = 92.0 ms                 │           │
 │  │                                                       │           │
 │  │  ALL 32 sequences advance 1 token per step            │           │
-│  │  Effective TPOT = 9.20 ms/token (per sequence)        │           │
-│  │  Throughput = 32 tokens / 9.20 ms = 3,478 tok/s       │           │
+│  │  Effective TPOT = 92.0 ms/token (per sequence)        │           │
+│  │  Throughput = 32 tokens / 92.0 ms = 348 tok/s         │           │
 │  │                                                       │           │
-│  │  128 output tokens × 9.20 ms = 1,177 ms total         │           │
+│  │  128 output tokens × 92.0 ms = 11,776 ms total        │           │
 │  └───────────────────────────────────────────────────────┘           │
 │                                                                     │
 │  ┌─── 3. Finish ────────────────────────────────────────┐           │
@@ -140,23 +140,23 @@ User Request (prompt: 10K tokens)
 │  Timing Breakdown (10K token request, 128 output tokens)            │
 │                                                                     │
 │  queue_wait:     ~850 ms  (depends on prefill node load)            │
-│  prefill_compute: 78.5 ms (2,640 new tokens × 0.035 ms/tok × 0.85)│
-│  kv_transfer:      2.6 ms (pipelined first chunk)                   │
-│  first_decode:     9.2 ms (one step with 32 concurrent seqs)        │
+│  prefill_compute: 785 ms (2,640 new tokens × 0.35 ms/tok × 0.85)   │
+│  kv_transfer:      6.7 ms (pipelined first chunk)                  │
+│  first_decode:     92 ms (one step with 32 concurrent seqs)        │
 │  ─────────────────────────                                          │
-│  TTFT:           ~940 ms                                            │
+│  TTFT:           ~1,734 ms                                          │
 │                                                                     │
-│  remaining_decode: 1,168 ms (127 × 9.20 ms)                        │
+│  remaining_decode: 11,684 ms (127 × 92.0 ms)                      │
 │  ─────────────────────────                                          │
-│  E2E:            ~2,108 ms                                          │
+│  E2E:            ~13,418 ms                                         │
 │                                                                     │
 │  Compare UNIFIED mode (same GPU does both):                         │
 │    queue_wait:     ~15,000 ms  (blocked by other requests' decode)  │
-│    prefill_compute: 78.5 ms                                         │
-│    decode:          1,177 ms                                        │
+│    prefill_compute: 785 ms                                          │
+│    decode:          11,776 ms                                       │
 │    ─────────────────────────                                        │
-│    TTFT:           ~15,078 ms  ← 16× worse than PD                 │
-│    GPU blocked for prefill+decode = 1,256 ms per request            │
+│    TTFT:           ~15,878 ms  (queue + prefill + first decode)     │
+│    GPU blocked for prefill+decode = 12,561 ms per request           │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -201,20 +201,19 @@ Block Birth → Active Use → Eviction → EIC → Cross-GPU Reuse
 ```
                     Capacity    Latency    Bandwidth    Blocks
                     ─────────   ─────────  ──────────   ──────
-  GPU HBM          10 GB       1 μs       3,350 GB/s   4,768
+  GPU HBM           5 GB       1 μs       3,350 GB/s     953
        ↓ evict
-  EIC (rack CXL)   128 GB      5 μs       100 GB/s     61,035
+  EIC (rack CXL)   128 GB      5 μs       100 GB/s    24,414
        ↓ evict
-  Remote SSD        3.2 TB     200 μs     7 GB/s       1,525,878
+  Remote SSD        3.2 TB     200 μs     7 GB/s      610,351
        ↓ miss
-  Recompute         ∞          ~78 ms     (GPU bound)  —
+  Recompute         ∞          workload   (GPU bound)  —
 
-  Each block = 2 MB (16 tokens × 128 KB/token)
+  Each block = 5 MiB (16 tokens × 320 KiB/token)
 
-  Working set for 10K context request = 625 blocks = 1.25 GB
-  HBM holds ~4 full requests
-  EIC holds ~48 full requests per rack
-  A rack with 16 GPUs can cache ~4×16 + 48 = 112 concurrent sessions
+  Working set for 10K context request = 625 blocks ≈ 3.1 GiB
+  HBM holds ~1 full 10K request per GPU
+  EIC holds ~40 full 10K requests per rack
 ```
 
 ## Unified vs PD: Why the Difference
@@ -225,11 +224,11 @@ UNIFIED MODE (one GPU does both):
   │ GPU Timeline:                                     │
   │                                                   │
   │ |--prefill--|--------decode (128 tokens)--------| │
-  │ |  78 ms   |          1,177 ms                  | │
+  │ | 785 ms   |          11,776 ms                 | │
   │ |  GPU computing KV  |  GPU reading weights     | │
   │ |  (compute bound)   |  (memory BW bound)       | │
   │                                                   │
-  │ Total GPU occupation: 1,255 ms per request        │
+  │ Total GPU occupation: 12,561 ms per request       │
   │                                                   │
   │ Next prefill must wait 1,255 ms → HEAD-OF-LINE    │
   │ BLOCKING. At 1 req/s/GPU, queue grows rapidly.    │
@@ -239,18 +238,18 @@ PD SEPARATED MODE:
   ┌──────────────────────────────────────────────────┐
   │ Prefill GPU:                                      │
   │ |--prefill--|--prefill--|--prefill--|  ...         │
-  │ |  78 ms   |  60 ms   |  90 ms   |               │
+  │ | 785 ms  | 600 ms  | 900 ms  |                 │
   │ GPU free after each prefill!                      │
   │ Throughput: ~12 req/s/GPU                         │
   │                                                   │
   │ Decode GPU (continuous batching, 32 seqs):        │
   │ |step|step|step|step|step|  ...                   │
-  │ |9ms |9ms |9ms |9ms |9ms |                        │
+  │ |92ms|92ms|92ms|92ms|92ms|                        │
   │ Each step advances ALL 32 sequences               │
-  │ Throughput: 32 × (1000/9.2) = 3,478 tok/s        │
+  │ Throughput: 32 × (1000/92) = 348 tok/s           │
   │                                                   │
   │ KV Transfer (RDMA, pipelined):                    │
   │ Overlaps with decode startup                      │
-  │ First chunk arrives in 2.6 ms                     │
+  │ First chunk arrives in ~6.7 ms                    │
   └──────────────────────────────────────────────────┘
 ```

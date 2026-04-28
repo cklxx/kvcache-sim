@@ -24,6 +24,9 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 
+FEATURE_DIM = 8
+
+
 def extract_features(
     block_hash: str,
     access_times: Dict[str, List[float]],
@@ -38,7 +41,7 @@ def extract_features(
     # accumulated history, so future accesses must be excluded)
     hist = [t for t in access_times.get(block_hash, []) if t <= current_time]
     if not hist:
-        return [0.0] * 8
+        return [0.0] * FEATURE_DIM
 
     recency = current_time - hist[-1]
     count = float(len(hist))
@@ -90,6 +93,9 @@ def build_feature_matrix(
         X_rows.append(feats)
         y_vals.append(math.log1p(reuse_dist))
 
-    X = np.array(X_rows, dtype=np.float32)
+    if X_rows:
+        X = np.array(X_rows, dtype=np.float32)
+    else:
+        X = np.empty((0, FEATURE_DIM), dtype=np.float32)
     y = np.array(y_vals, dtype=np.float32)
     return X, y
