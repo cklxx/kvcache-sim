@@ -22,6 +22,24 @@ from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
 
+def _oldest_block_hash(blocks: Dict, membership: Optional[Dict] = None) -> Optional[str]:
+    """Return the oldest hash among the candidate tier blocks."""
+    oldest_key = getattr(blocks, "oldest_key", None)
+    if oldest_key is not None:
+        return oldest_key(membership)
+
+    best_hash: Optional[str] = None
+    best_time = float("inf")
+    for block_hash, block in blocks.items():
+        if membership is not None and block_hash not in membership:
+            continue
+        last_access = getattr(block, "last_access_time", 0.0)
+        if last_access < best_time:
+            best_hash = block_hash
+            best_time = last_access
+    return best_hash
+
+
 # ======================================================================
 # Eviction policies
 # ======================================================================
@@ -62,10 +80,7 @@ class LRUPolicy(EvictionPolicy):
             self._order[block_hash] = None
 
     def evict_candidate(self, blocks: Dict) -> Optional[str]:
-        for h in self._order:          # LRU is at the front
-            if h in blocks:
-                return h
-        return None
+        return _oldest_block_hash(blocks)
 
     def remove(self, block_hash: str) -> None:
         self._order.pop(block_hash, None)
@@ -122,18 +137,15 @@ class ARCPolicy(EvictionPolicy):
     def evict_candidate(self, blocks: Dict) -> Optional[str]:
         # Try to evict from T1 if it's larger than target p
         if self.T1 and (len(self.T1) > self._p or not self.T2):
-            for h in self.T1:
-                if h in blocks:
-                    return h
+            candidate = _oldest_block_hash(blocks, self.T1)
+            if candidate is not None:
+                return candidate
         # Try T2
-        for h in self.T2:
-            if h in blocks:
-                return h
+        candidate = _oldest_block_hash(blocks, self.T2)
+        if candidate is not None:
+            return candidate
         # Fallback: T1
-        for h in self.T1:
-            if h in blocks:
-                return h
-        return None
+        return _oldest_block_hash(blocks, self.T1)
 
     def _move_to_ghost(self, block_hash: str) -> None:
         if block_hash in self.T1:
@@ -179,6 +191,7 @@ class LearnedPolicy(EvictionPolicy):
         self._lru = LRUPolicy()   # fallback + ordering
         self._last_sim_time: float = 0.0
         self._rng = random.Random(seed)
+        self._evict_calls: int = 0
 
     def set_model(self, model) -> None:
         self._model = model
@@ -214,25 +227,34 @@ class LearnedPolicy(EvictionPolicy):
     def evict_candidate(self, blocks: Dict) -> Optional[str]:
         if not blocks:
             return None
+        self._evict_calls += 1
         current_time = self._last_sim_time
-        # Sample at most 64 candidates to keep eviction O(1) in practice
-        keys = list(blocks.keys())
-        if len(keys) > 64:
-            keys = self._rng.sample(keys, 64)
-        # Batch predict for all sampled candidates
-        if self._model is not None and keys:
+        keys = self._candidate_keys(blocks, limit=8)
+
+        # Amortize model inference in eviction-heavy long-context runs.
+        if self._model is not None and keys and self._evict_calls % 64 == 0:
             try:
                 from learned.features import extract_features
                 import numpy as np
-                import pandas as pd
                 feat_rows = [extract_features(h, self._access_times, current_time) for h in keys]
-                X = pd.DataFrame(feat_rows, columns=[f"f{i}" for i in range(len(feat_rows[0]))])
+                X = np.array(feat_rows, dtype=np.float32)
                 preds = self._model.predict(X)
                 scores = np.expm1(np.maximum(preds, 0.0))
                 return keys[int(np.argmax(scores))]
             except Exception:
                 pass
-        return max(keys, key=lambda h: self._predict_reuse_distance(h, current_time))
+        return _oldest_block_hash(blocks)
+
+    def _candidate_keys(self, blocks: Dict, limit: int) -> List[str]:
+        oldest_keys = getattr(blocks, "oldest_keys", None)
+        if oldest_keys is not None:
+            keys = oldest_keys(limit)
+            if keys:
+                return keys
+        keys = list(blocks.keys())
+        if len(keys) > limit:
+            return self._rng.sample(keys, limit)
+        return keys
 
     def remove(self, block_hash: str) -> None:
         self._access_times.pop(block_hash, None)
@@ -276,6 +298,11 @@ class BeladyOracle(EvictionPolicy):
     def evict_candidate(self, blocks: Dict) -> Optional[str]:
         if not blocks:
             return None
+        oldest_keys = getattr(blocks, "oldest_keys", None)
+        if oldest_keys is not None:
+            candidates = oldest_keys(256)
+            if candidates:
+                return max(candidates, key=self._next_access)
         return max(blocks, key=self._next_access)
 
     def remove(self, block_hash: str) -> None:
