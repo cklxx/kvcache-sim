@@ -76,10 +76,6 @@ class RadixTree:
         self.capacity_bytes = capacity_bytes
         self.block_size = block_size
         self.used_bytes: int = 0
-        self._pending_insert_path: Optional[List[str]] = None
-        self._pending_next_index: int = 0
-        self._pending_anchor: RadixTreeNode = self.root
-        self._pending_available: Set[int] = set()
 
     # ------------------------------------------------------------------
     # Insert
@@ -99,12 +95,6 @@ class RadixTree:
         """
         if not block_hashes:
             return 0
-
-        pending_count = self._insert_pending_suffix(
-            block_hashes, size_bytes, current_time
-        )
-        if pending_count is not None:
-            return pending_count
 
         new_count, _ = self._insert_from_parent(
             self.root,
@@ -136,8 +126,47 @@ class RadixTree:
                 break
             matched.append(node)
             parent = node
-        self._remember_lookup(block_hashes, len(matched), parent)
         return len(matched), matched
+
+    def insert_suffix_after_prefix(
+        self,
+        full_sequence: List[str],
+        prefix_depth: int,
+        suffix_hashes: List[str],
+        size_bytes: int,
+        current_time: float,
+    ) -> int:
+        """
+        Insert suffix_hashes under an already matched prefix of full_sequence.
+
+        This is the explicit form for the common prefill flow:
+        lookup_prefix(full_sequence) followed by inserting only the missing
+        suffix. Plain insert_sequence remains stateless and always inserts the
+        given sequence from the root.
+        """
+        if not suffix_hashes:
+            return 0
+        if prefix_depth < 0 or prefix_depth > len(full_sequence):
+            raise ValueError("prefix_depth is outside full_sequence")
+        suffix_end = prefix_depth + len(suffix_hashes)
+        if full_sequence[prefix_depth:suffix_end] != suffix_hashes:
+            raise ValueError("suffix_hashes must be contiguous in full_sequence")
+
+        parent = self.root
+        for bh in full_sequence[:prefix_depth]:
+            node = parent.children.get(bh)
+            if node is None:
+                raise ValueError("matched prefix is not present in the tree")
+            parent = node
+
+        new_count, _ = self._insert_from_parent(
+            parent,
+            suffix_hashes,
+            size_bytes,
+            current_time,
+            start_depth=prefix_depth,
+        )
+        return new_count
 
     def contains(self, block_hash: str) -> bool:
         return block_hash in self._hash_index
@@ -215,8 +244,6 @@ class RadixTree:
             if node.parent.is_evictable and node.parent.block_hash != "__ROOT__":
                 self._evictable_leaves.add(node.parent)
         self._unindex_node(node)
-        if self._pending_anchor is node:
-            self._clear_pending_insert()
 
     # ------------------------------------------------------------------
     # Path helpers
@@ -293,98 +320,6 @@ class RadixTree:
             matched.append(node)
             parent = node
         return matched
-
-    def _remember_lookup(
-        self,
-        block_hashes: List[str],
-        match_depth: int,
-        anchor: RadixTreeNode,
-    ) -> None:
-        """Remember the miss suffix so insert_sequence can append it later."""
-        if match_depth >= len(block_hashes):
-            self._clear_pending_insert()
-            return
-        self._pending_insert_path = list(block_hashes)
-        self._pending_next_index = match_depth
-        self._pending_anchor = anchor
-        self._pending_available = set()
-
-    def _insert_pending_suffix(
-        self,
-        block_hashes: List[str],
-        size_bytes: int,
-        current_time: float,
-    ) -> Optional[int]:
-        """
-        Append hashes that belong to the miss suffix from the last lookup.
-
-        Prefill flows commonly call lookup_prefix(full_path), then insert only
-        the missing suffix.  This preserves the continuous tree edge from the
-        matched prefix to that suffix without making lookup depend on the
-        global hash index.
-        """
-        if self._pending_insert_path is None:
-            return None
-        if self._pending_anchor is not self.root and not self._is_indexed(
-            self._pending_anchor
-        ):
-            self._clear_pending_insert()
-            return None
-
-        positions: List[int] = []
-        search_start = self._pending_next_index
-        for bh in block_hashes:
-            pos = self._find_pending_position(bh, search_start)
-            if pos is None:
-                return None
-            positions.append(pos)
-            search_start = pos + 1
-
-        self._pending_available.update(positions)
-        new_count = 0
-        while (
-            self._pending_insert_path is not None
-            and self._pending_next_index in self._pending_available
-        ):
-            bh = self._pending_insert_path[self._pending_next_index]
-            node, created = self._ensure_child(
-                self._pending_anchor,
-                bh,
-                size_bytes,
-                current_time,
-                prefix_depth=self._pending_next_index,
-            )
-            if created:
-                new_count += 1
-            self._pending_anchor = node
-            self._pending_next_index += 1
-
-            if self._pending_next_index >= len(self._pending_insert_path):
-                break
-
-        if self._pending_anchor.block_hash != "__ROOT__" and self._pending_anchor.is_evictable:
-            self._evictable_leaves.add(self._pending_anchor)
-
-        if (
-            self._pending_insert_path is not None
-            and self._pending_next_index >= len(self._pending_insert_path)
-        ):
-            self._clear_pending_insert()
-        return new_count
-
-    def _find_pending_position(self, block_hash: str, start: int) -> Optional[int]:
-        if self._pending_insert_path is None:
-            return None
-        for idx in range(start, len(self._pending_insert_path)):
-            if self._pending_insert_path[idx] == block_hash:
-                return idx
-        return None
-
-    def _clear_pending_insert(self) -> None:
-        self._pending_insert_path = None
-        self._pending_next_index = 0
-        self._pending_anchor = self.root
-        self._pending_available = set()
 
     def _index_node(self, node: RadixTreeNode) -> None:
         self._hash_index.setdefault(node.block_hash, []).append(node)

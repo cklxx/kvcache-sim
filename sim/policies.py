@@ -172,11 +172,13 @@ class LearnedPolicy(EvictionPolicy):
     Falls back to LRU when the model is not available.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, seed: int = 0) -> None:
+        import random
         self._access_times: Dict[str, List[float]] = {}
         self._model = None
         self._lru = LRUPolicy()   # fallback + ordering
         self._last_sim_time: float = 0.0
+        self._rng = random.Random(seed)
 
     def set_model(self, model) -> None:
         self._model = model
@@ -214,10 +216,9 @@ class LearnedPolicy(EvictionPolicy):
             return None
         current_time = self._last_sim_time
         # Sample at most 64 candidates to keep eviction O(1) in practice
-        import random as _random
         keys = list(blocks.keys())
         if len(keys) > 64:
-            keys = _random.sample(keys, 64)
+            keys = self._rng.sample(keys, 64)
         # Batch predict for all sampled candidates
         if self._model is not None and keys:
             try:

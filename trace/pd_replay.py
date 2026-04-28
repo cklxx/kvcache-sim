@@ -32,7 +32,10 @@ class PDReplayer:
         self.verbose = verbose
 
         # Build the orchestration pipeline
-        self.prefill_router = PrefillRouter(pd_cluster.prefill_nodes)
+        self.prefill_router = PrefillRouter(
+            pd_cluster.prefill_nodes,
+            seed=pd_cluster.routing_seed,
+        )
         self.decode_router = DecodeRouter(pd_cluster.decode_nodes)
         self.transfer_model = KVTransferModel(
             pd_cluster.pd_config.transfer,

@@ -18,6 +18,7 @@ Tier hierarchy per GPU read path:
 """
 from __future__ import annotations
 
+import random
 from typing import Dict, List, Optional, Tuple
 
 from .metrics import Metrics
@@ -314,9 +315,15 @@ class Rack:
 class Cluster:
     """万卡级集群：N racks × M GPUs + shared EIC per rack."""
 
-    def __init__(self, racks: List[Rack], network: NetworkModel) -> None:
+    def __init__(
+        self,
+        racks: List[Rack],
+        network: NetworkModel,
+        routing_seed: int = 0,
+    ) -> None:
         self.racks = racks
         self.network = network
+        self.routing_seed = routing_seed
         self.all_gpus: List[GPUNode] = []
         for rack in racks:
             self.all_gpus.extend(rack.gpu_nodes)
@@ -404,10 +411,11 @@ class ClusterRouter:
     3. Prefer GPUs within the same rack as existing session traffic
     """
 
-    def __init__(self, cluster: Cluster) -> None:
+    def __init__(self, cluster: Cluster, seed: Optional[int] = None) -> None:
         self.cluster = cluster
         self._rr: int = 0
         self._session_gpu: Dict[str, int] = {}
+        self._rng = random.Random(cluster.routing_seed if seed is None else seed)
 
     def route(self, block_hashes: List[str], session_id: str = "") -> GPUNode:
         # Sticky routing for returning sessions
@@ -419,10 +427,9 @@ class ClusterRouter:
             return self._next_rr(session_id)
 
         # Score a random subset of GPUs (for scalability)
-        import random
         candidates = self.cluster.all_gpus
         if len(candidates) > 32:
-            candidates = random.sample(candidates, 32)
+            candidates = self._rng.sample(candidates, 32)
 
         best: Optional[GPUNode] = None
         best_score = -1.0
@@ -485,6 +492,10 @@ def build_cluster(
 
     racks: List[Rack] = []
     gid = 0
+    routing_seed = cc.get(
+        "routing_seed",
+        cfg.get("cluster_trace", cfg.get("trace", {})).get("seed", 42),
+    )
     for rid in range(n_racks):
         # Shared EIC for this rack
         eic = EICPool(
@@ -524,4 +535,4 @@ def build_cluster(
 
         racks.append(Rack(rid, gpus, eic))
 
-    return Cluster(racks, network)
+    return Cluster(racks, network, routing_seed=routing_seed)

@@ -273,12 +273,14 @@ class PrefillNode:
         # One RDMA round-trip with all hashes, not per-block
         # Probe cost: 1 RTT = intra_rack_latency + rdma_base ≈ 8μs
         eic_hit_hashes: List[str] = []
-        eic_miss_hashes: List[str] = []
+        first_miss_idx = 0
         for bh in remaining_hashes:
             if self.eic.contains(bh):
                 eic_hit_hashes.append(bh)
+                first_miss_idx += 1
             else:
-                eic_miss_hashes.append(bh)
+                break
+        eic_miss_hashes = remaining_hashes[first_miss_idx:]
         probe_latency_ms = self.network.intra_rack_ms()  # single RTT
 
         # ── 3. Async batch fetch EIC hits (RDMA one-sided READ) ─
@@ -293,11 +295,15 @@ class PrefillNode:
                 + eic_fetch_bytes / rdma_bw_bytes_per_ms
             )
             # Actually read from EIC and promote to local tree
-            for bh in eic_hit_hashes:
+            for idx, bh in enumerate(eic_hit_hashes):
                 blk = self.eic.read(bh, self.gpu_id, effective_time)
                 if blk is not None:
-                    self.radix_tree.insert_sequence(
-                        [bh], block_size, effective_time + eic_fetch_ms
+                    self.radix_tree.insert_suffix_after_prefix(
+                        block_hashes,
+                        match_depth + idx,
+                        [bh],
+                        block_size,
+                        effective_time + eic_fetch_ms,
                     )
                     self.metrics.total_requests += 1
                     self.metrics.record_hit("EIC", eic_fetch_ms)
@@ -327,8 +333,12 @@ class PrefillNode:
 
         # ── 5. Insert new blocks + async EIC backup ─────────────
         if eic_miss_hashes:
-            self.radix_tree.insert_sequence(
-                eic_miss_hashes, block_size, effective_time + compute_ms
+            self.radix_tree.insert_suffix_after_prefix(
+                block_hashes,
+                hbm_hits + eic_hits,
+                eic_miss_hashes,
+                block_size,
+                effective_time + compute_ms,
             )
         self.radix_tree.acquire_sequence(block_hashes)
 

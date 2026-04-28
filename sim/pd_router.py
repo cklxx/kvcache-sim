@@ -43,10 +43,11 @@ class PrefillRouter:
     Session affinity for multi-turn conversations.
     """
 
-    def __init__(self, prefill_nodes: List[PrefillNode]) -> None:
+    def __init__(self, prefill_nodes: List[PrefillNode], seed: int = 0) -> None:
         self.prefill_nodes = prefill_nodes
         self._session_affinity: Dict[str, int] = {}
         self._rr: int = 0
+        self._rng = random.Random(seed)
 
     def route(self, request: PDRequest, current_time: float) -> PrefillNode:
         # Soft session affinity: prefer previous node but re-evaluate if busy
@@ -65,7 +66,7 @@ class PrefillRouter:
         # Score candidates (sample for scalability)
         candidates = self.prefill_nodes
         if len(candidates) > 16:
-            candidates = random.sample(candidates, 16)
+            candidates = self._rng.sample(candidates, 16)
             # Always include affinity node if it exists
             if affinity_node and affinity_node not in candidates:
                 candidates[0] = affinity_node
@@ -221,6 +222,12 @@ class PDOrchestrator:
     def _sequence_id(self, request: PDRequest) -> str:
         return f"{request.session_id}:{request.turn_id}"
 
+    def _event_sequence_id(self, request: PDRequest, request_index: int) -> str:
+        base = self._sequence_id(request)
+        if request_index >= 0:
+            return f"{base}:{request_index}"
+        return base
+
     def prepare_prefill(
         self,
         request: PDRequest,
@@ -244,7 +251,7 @@ class PDOrchestrator:
         return PDPrefillEvent(
             request_index=request_index,
             request=request,
-            sequence_id=self._sequence_id(request),
+            sequence_id=self._event_sequence_id(request, request_index),
             prefill_node=p_node,
             prefill_result=prefill_result,
             arrival_time=current_time,

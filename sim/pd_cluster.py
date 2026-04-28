@@ -64,12 +64,14 @@ class PDCluster:
         pd_config: PDConfig,
         prefill_nodes: List[PrefillNode],
         decode_nodes: List[DecodeNode],
+        routing_seed: int = 0,
     ) -> None:
         self.racks = racks
         self.network = network
         self.pd_config = pd_config
         self.prefill_nodes = prefill_nodes
         self.decode_nodes = decode_nodes
+        self.routing_seed = routing_seed
 
     @property
     def total_prefill_gpus(self) -> int:
@@ -178,6 +180,10 @@ def build_pd_cluster(
     all_decode: List[DecodeNode] = []
     racks: List[Rack] = []
     gid = 0
+    routing_seed = cfg.get("pd_separation", {}).get(
+        "routing_seed",
+        cfg.get("pd_trace", cfg.get("trace", {})).get("seed", 42),
+    )
 
     for rid in range(n_racks):
         eic = EICPool(
@@ -239,4 +245,11 @@ def build_pd_cluster(
 
         racks.append(Rack(rid, gpu_nodes, eic))
 
-    return PDCluster(racks, network, pd_config, all_prefill, all_decode)
+    return PDCluster(
+        racks,
+        network,
+        pd_config,
+        all_prefill,
+        all_decode,
+        routing_seed=routing_seed,
+    )

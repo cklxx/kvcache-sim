@@ -87,3 +87,31 @@ def test_pd_replay_keeps_overlapping_decode_sequences(monkeypatch) -> None:
     assert metrics.total_requests == len(requests)
     assert max(seen_active_counts) > 1
     assert all(node.active_count == 0 for node in cluster.decode_nodes)
+
+
+def test_pd_replay_keeps_duplicate_session_turn_requests() -> None:
+    cfg = _small_pd_config()
+    cluster = build_pd_cluster(cfg, PDConfig.from_config(cfg))
+    requests = [
+        Request(
+            session_id="same-session",
+            turn_id=0,
+            timestamp=0.0,
+            block_hashes=[f"shared:b{j}" for j in range(4)],
+            block_size=1024,
+            prompt_tokens=64,
+        ),
+        Request(
+            session_id="same-session",
+            turn_id=0,
+            timestamp=0.001,
+            block_hashes=[f"shared:b{j}" for j in range(4)],
+            block_size=1024,
+            prompt_tokens=64,
+        ),
+    ]
+
+    metrics = PDReplayer(cluster).run(requests)
+
+    assert metrics.total_requests == len(requests)
+    assert all(node.active_count == 0 for node in cluster.decode_nodes)
