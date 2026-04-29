@@ -19,6 +19,9 @@ class Metrics:
     # Per-tier hits and latency
     tier_hits: Dict[str, int] = field(default_factory=dict)
     tier_latency_ms: Dict[str, float] = field(default_factory=dict)
+    tier_used_bytes: Dict[str, int] = field(default_factory=dict)
+    tier_capacity_bytes: Dict[str, int] = field(default_factory=dict)
+    tier_blocks: Dict[str, int] = field(default_factory=dict)
 
     # System events
     evictions: int = 0
@@ -53,6 +56,24 @@ class Metrics:
     def record_miss(self) -> None:
         self.total_misses += 1
 
+    def record_storage(
+        self,
+        tier_name: str,
+        used_bytes: int,
+        capacity_bytes: int,
+        block_count: int = 0,
+    ) -> None:
+        """Add a storage-usage snapshot for one tier."""
+        self.tier_used_bytes[tier_name] = (
+            self.tier_used_bytes.get(tier_name, 0) + int(used_bytes)
+        )
+        self.tier_capacity_bytes[tier_name] = (
+            self.tier_capacity_bytes.get(tier_name, 0) + int(capacity_bytes)
+        )
+        self.tier_blocks[tier_name] = (
+            self.tier_blocks.get(tier_name, 0) + int(block_count)
+        )
+
     # ------------------------------------------------------------------
     # Derived KPIs
     # ------------------------------------------------------------------
@@ -71,6 +92,12 @@ class Metrics:
         if self.total_requests == 0:
             return 0.0
         return self.tier_hits.get(tier_name, 0) / self.total_requests
+
+    def tier_utilization(self, tier_name: str) -> float:
+        capacity = self.tier_capacity_bytes.get(tier_name, 0)
+        if capacity <= 0:
+            return 0.0
+        return self.tier_used_bytes.get(tier_name, 0) / capacity
 
     @property
     def prefix_hit_rate(self) -> float:
@@ -97,6 +124,11 @@ class Metrics:
         }
         for t in self.tier_names:
             d[f"hit_rate_{t}"] = round(self.tier_hit_rate(t), 4)
+            d[f"used_gb_{t}"] = round(self.tier_used_bytes.get(t, 0) / 1e9, 3)
+            d[f"capacity_gb_{t}"] = round(
+                self.tier_capacity_bytes.get(t, 0) / 1e9, 3
+            )
+            d[f"utilization_{t}"] = round(self.tier_utilization(t), 4)
         return d
 
     def __repr__(self) -> str:

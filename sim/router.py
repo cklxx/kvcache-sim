@@ -179,4 +179,11 @@ class Router:
             for tier in m.tier_names:
                 combined.tier_hits[tier] = combined.tier_hits.get(tier, 0) + m.tier_hits.get(tier, 0)
                 combined.tier_latency_ms[tier] = combined.tier_latency_ms.get(tier, 0.0) + m.tier_latency_ms.get(tier, 0.0)
+            for tier in w.cache.tiers:
+                combined.record_storage(
+                    tier.name,
+                    tier.used,
+                    tier.capacity_bytes,
+                    len(tier.blocks),
+                )
         return combined

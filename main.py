@@ -107,6 +107,76 @@ def _print_table(results: dict, tier_names=None) -> None:
             print("  ".join(parts))
 
 
+def _format_bytes(n: int | float) -> str:
+    n = float(n)
+    if n >= 1e12:
+        return f"{n / 1e12:.2f}TB"
+    if n >= 1e9:
+        return f"{n / 1e9:.1f}GB"
+    if n >= 1e6:
+        return f"{n / 1e6:.0f}MB"
+    if n >= 1e3:
+        return f"{n / 1e3:.0f}KB"
+    return f"{n:.0f}B"
+
+
+def _storage_cell(metrics, tier_name: str) -> str:
+    used = metrics.tier_used_bytes.get(tier_name, 0)
+    capacity = metrics.tier_capacity_bytes.get(tier_name, 0)
+    if capacity <= 0:
+        return "-"
+    util = used / capacity
+    blocks = metrics.tier_blocks.get(tier_name, 0)
+    return (
+        f"{_format_bytes(used)}/{_format_bytes(capacity)} "
+        f"({util:.0%}, {blocks:,} blk)"
+    )
+
+
+def _print_storage_table(results: dict, tier_names) -> None:
+    """Print final storage usage captured from the actual replayed caches."""
+    try:
+        from tabulate import tabulate
+        rows = []
+        for name, m in results.items():
+            rows.append([name] + [_storage_cell(m, tier) for tier in tier_names])
+        headers = ["Config"] + [f"{tier} Used/Cap" for tier in tier_names]
+        print("\nStorage usage (finite cache, after replay):")
+        print(tabulate(rows, headers=headers, tablefmt="rounded_outline"))
+    except ImportError:
+        print("\nStorage usage (finite cache, after replay):")
+        for name, m in results.items():
+            parts = [name]
+            parts.extend(f"{tier}={_storage_cell(m, tier)}" for tier in tier_names)
+            print("  " + "  ".join(parts))
+
+
+def _pd_storage_cells(metrics) -> list[str]:
+    prefill = metrics.prefill_cache
+    decode = metrics.decode_cache
+    if decode.tier_capacity_bytes.get("HBM", 0) > 0:
+        return [
+            _storage_cell(prefill, "HBM"),
+            _storage_cell(decode, "HBM"),
+            _storage_cell(prefill, "EIC"),
+        ]
+    return [_storage_cell(prefill, "HBM"), "-", _storage_cell(prefill, "EIC")]
+
+
+def _print_pd_storage_table(results: dict) -> None:
+    try:
+        from tabulate import tabulate
+        rows = [[name] + _pd_storage_cells(m) for name, m in results.items()]
+        headers = ["Config", "Prefill/All HBM", "Decode HBM", "EIC"]
+        print("\nStorage usage (finite cache, after replay):")
+        print(tabulate(rows, headers=headers, tablefmt="rounded_outline"))
+    except ImportError:
+        print("\nStorage usage (finite cache, after replay):")
+        for name, m in results.items():
+            p_hbm, d_hbm, eic = _pd_storage_cells(m)
+            print(f"  {name}  P/All-HBM={p_hbm}  D-HBM={d_hbm}  EIC={eic}")
+
+
 def _print_context_table(ctx_results: dict) -> None:
     """Print context length sweep results."""
     try:
@@ -303,6 +373,7 @@ def run_single_node(cfg: dict, args) -> None:
     # 5. Results
     print("\n[5/5] Results:")
     _print_table(results, ["HBM", "DRAM", "SSD"])
+    _print_storage_table(results, ["HBM", "DRAM", "SSD"])
 
     # 6. Plot
     if not args.no_plot:
@@ -438,16 +509,19 @@ def run_pd(cfg: dict, args) -> None:
     print(f"\n[2/4] Unified vs PD-Separated:")
     uvp_results = runner.run_unified_vs_pd(requests)
     _print_pd_table(uvp_results)
+    _print_pd_storage_table(uvp_results)
 
     # 3. P:D Ratio Sweep
     print(f"\n[3/4] P:D Ratio Sweep:")
     ratio_results = runner.run_pd_ratio_sweep(requests)
     _print_pd_table(ratio_results)
+    _print_pd_storage_table(ratio_results)
 
     # 4. Transfer Strategy Comparison
     print(f"\n[4/4] Transfer Strategy Comparison:")
     transfer_results = runner.run_transfer_strategy(requests)
     _print_pd_table(transfer_results)
+    _print_pd_storage_table(transfer_results)
 
     # 5. Context Length Sweep (optional, longer)
     if not args.no_plot and not args.skip_context_sweep:
@@ -606,6 +680,7 @@ def run_cluster(cfg: dict, args) -> None:
 
     print("\n  EIC Sizing Results:")
     _print_table(eic_results, ["HBM", "EIC", "Remote"])
+    _print_storage_table(eic_results, ["HBM", "EIC"])
 
     # ── 3. Eviction policy comparison at cluster scale ───────────────
     print(f"\n[3/4] Eviction Policies at Cluster Scale:")
@@ -613,6 +688,7 @@ def run_cluster(cfg: dict, args) -> None:
 
     print("\n  Eviction Policy Results (cluster):")
     _print_table(eviction_results, ["HBM", "EIC", "Remote"])
+    _print_storage_table(eviction_results, ["HBM", "EIC"])
 
     # ── 4. Context length sweep ────────────────────────────────────
     ctx_results = None
@@ -628,7 +704,7 @@ def run_cluster(cfg: dict, args) -> None:
     # ── 5. Final cluster stats + credibility report ──────────────────
     print(f"\n[5/5] Final Cluster Topology:")
     from sim.cluster import build_cluster
-    cluster = build_cluster(cfg)
+    cluster = runner.last_cluster or build_cluster(cfg)
     _print_cluster_info(cluster)
     _print_credibility_report(cfg, cluster)
 

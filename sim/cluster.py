@@ -371,6 +371,19 @@ class Cluster:
                     combined.tier_latency_ms.get(t, 0.0)
                     + m.tier_latency_ms.get(t, 0.0)
                 )
+            combined.record_storage(
+                "HBM",
+                gpu.hbm.used,
+                gpu.hbm.capacity_bytes,
+                len(gpu.hbm.blocks),
+            )
+        for rack in self.racks:
+            combined.record_storage(
+                "EIC",
+                rack.eic.tier.used,
+                rack.eic.tier.capacity_bytes,
+                len(rack.eic.tier.blocks),
+            )
         return combined
 
     @property

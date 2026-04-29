@@ -121,6 +121,8 @@ class PDReplayer:
             flush_until(min(next_prefill, next_decode))
 
         record_completed(self.orchestrator.drain_decode())
+        metrics.prefill_cache = self.cluster.aggregate_prefill_metrics()
+        metrics.decode_cache = self.cluster.aggregate_decode_metrics()
         return metrics
 
 

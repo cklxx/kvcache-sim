@@ -110,6 +110,47 @@ class PDCluster:
             combined.total_latency_ms += m.total_latency_ms
             for t in m.tier_names:
                 combined.tier_hits[t] = combined.tier_hits.get(t, 0) + m.tier_hits.get(t, 0)
+                combined.tier_latency_ms[t] = (
+                    combined.tier_latency_ms.get(t, 0.0)
+                    + m.tier_latency_ms.get(t, 0.0)
+                )
+            combined.record_storage(
+                "HBM",
+                n.radix_tree.used_bytes,
+                n.radix_tree.capacity_bytes,
+                n.radix_tree.total_blocks,
+            )
+        for rack in self.racks:
+            combined.record_storage(
+                "EIC",
+                rack.eic.tier.used,
+                rack.eic.tier.capacity_bytes,
+                len(rack.eic.tier.blocks),
+            )
+        return combined
+
+    def aggregate_decode_metrics(self):
+        from .metrics import Metrics
+        combined = Metrics(tier_names=["HBM", "EIC", "Remote"])
+        for n in self.decode_nodes:
+            m = n.metrics
+            combined.total_requests += m.total_requests
+            combined.total_hits += m.total_hits
+            combined.total_misses += m.total_misses
+            combined.evictions += m.evictions
+            combined.total_latency_ms += m.total_latency_ms
+            for t in m.tier_names:
+                combined.tier_hits[t] = combined.tier_hits.get(t, 0) + m.tier_hits.get(t, 0)
+                combined.tier_latency_ms[t] = (
+                    combined.tier_latency_ms.get(t, 0.0)
+                    + m.tier_latency_ms.get(t, 0.0)
+                )
+            combined.record_storage(
+                "HBM",
+                n.radix_tree.used_bytes,
+                n.radix_tree.capacity_bytes,
+                n.radix_tree.total_blocks,
+            )
         return combined
 
     def eic_utilizations(self) -> Dict[int, float]:

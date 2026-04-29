@@ -172,26 +172,24 @@ class ClusterExperimentRunner:
     """
     Run experiments on the 万卡-scale cluster simulator.
 
-    Compares EIC sizing (no EIC / small / medium / large) and
-    eviction policies at cluster scale.
+    Compares EIC sizing relative to the configured rack-level EIC capacity
+    and eviction policies at cluster scale.
     """
 
     def __init__(self, config: dict, warmup: int = 500) -> None:
         self.config = config
         self.warmup = warmup
+        self.last_cluster = None
 
     def run_eic_sizing(self, requests: List[Request]) -> Dict[str, Metrics]:
         """Compare different EIC capacities per rack."""
         from sim.cluster import build_cluster
         from trace.cluster_replay import ClusterReplayer
 
-        configs = [
-            ("No EIC (HBM only)", 0.0, 0),
-            ("EIC 2×20 MB",       0.02, 2),
-            ("EIC 4×20 MB",       0.02, 4),
-            ("EIC 4×50 MB",       0.05, 4),
-            ("EIC 8×50 MB",       0.05, 8),
-        ]
+        base_eic = self.config.get("cluster", {}).get("eic", {})
+        base_nodes = max(1, int(base_eic.get("nodes_per_rack", 4)))
+        base_cap_per_node = float(base_eic.get("capacity_per_node_gb", 32.0))
+        configs = _eic_capacity_sweep(base_cap_per_node, base_nodes)
 
         results: Dict[str, Metrics] = {}
         for name, cap_per_node, n_nodes in configs:
@@ -200,6 +198,7 @@ class ClusterExperimentRunner:
             cluster = build_cluster(cfg)
             replayer = ClusterReplayer(cluster, warmup_count=self.warmup)
             metrics = replayer.run(requests)
+            self.last_cluster = cluster
             cross = cluster.total_cross_gpu_eic_hits
             results[name] = metrics
             print(
@@ -237,6 +236,7 @@ class ClusterExperimentRunner:
             cluster = build_cluster(self.config, eviction_factory=factory)
             replayer = ClusterReplayer(cluster, warmup_count=self.warmup)
             metrics = replayer.run(requests)
+            self.last_cluster = cluster
             results[name] = metrics
             print(
                 f"hit={metrics.hit_rate:.2%}  "
@@ -336,3 +336,37 @@ def _override_eic(config: dict, capacity_per_node_gb: float, num_nodes: int) -> 
     eic["capacity_per_node_gb"] = capacity_per_node_gb
     eic["nodes_per_rack"] = num_nodes
     return cfg
+
+
+def _eic_capacity_sweep(
+    base_capacity_per_node_gb: float,
+    base_nodes_per_rack: int,
+) -> list[tuple[str, float, int]]:
+    """
+    Build EIC capacity points relative to the configured rack EIC.
+
+    The default config is 4 × 32 GB = 128 GB/rack. Older experiments used
+    MB-scale placeholder capacities; that was useful for stress tests but
+    misleading for H100-class cluster sizing.
+    """
+    points = [0.0, 0.25, 0.5, 1.0, 2.0]
+    configs: list[tuple[str, float, int]] = []
+    for scale in points:
+        if scale == 0.0:
+            configs.append(("No EIC (HBM only)", 0.0, 0))
+            continue
+        cap_per_node = base_capacity_per_node_gb * scale
+        total_per_rack = cap_per_node * base_nodes_per_rack
+        label = (
+            f"EIC {scale:g}× base "
+            f"({base_nodes_per_rack}×{_format_capacity_gb(cap_per_node)}, "
+            f"{_format_capacity_gb(total_per_rack)}/rack)"
+        )
+        configs.append((label, cap_per_node, base_nodes_per_rack))
+    return configs
+
+
+def _format_capacity_gb(value_gb: float) -> str:
+    if value_gb >= 1.0:
+        return f"{value_gb:g}GB"
+    return f"{value_gb * 1024:g}MB"
