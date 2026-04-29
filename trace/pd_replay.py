@@ -133,5 +133,5 @@ def _to_pd_request(req: Request, max_output_tokens: int = 128) -> PDRequest:
         block_hashes=req.block_hashes,
         block_size=req.block_size,
         prompt_tokens=req.prompt_tokens if req.prompt_tokens > 0 else len(req.block_hashes) * 32,
-        max_output_tokens=max_output_tokens,
+        max_output_tokens=req.output_tokens if req.output_tokens > 0 else max_output_tokens,
     )

@@ -1,7 +1,7 @@
 from sim.pd_cluster import PDConfig, build_pd_cluster
 from sim.pd_nodes import DecodeNode
 from trace.generator import Request
-from trace.pd_replay import PDReplayer
+from trace.pd_replay import PDReplayer, _to_pd_request
 
 
 def _small_pd_config() -> dict:
@@ -115,3 +115,19 @@ def test_pd_replay_keeps_duplicate_session_turn_requests() -> None:
 
     assert metrics.total_requests == len(requests)
     assert all(node.active_count == 0 for node in cluster.decode_nodes)
+
+
+def test_pd_request_uses_per_request_output_tokens() -> None:
+    req = Request(
+        session_id="s",
+        turn_id=0,
+        timestamp=0.0,
+        block_hashes=["b0"],
+        block_size=1024,
+        prompt_tokens=16,
+        output_tokens=7,
+    )
+
+    pd_req = _to_pd_request(req, max_output_tokens=128)
+
+    assert pd_req.max_output_tokens == 7

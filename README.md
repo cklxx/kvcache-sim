@@ -96,7 +96,54 @@ python main.py --cluster
 
 # PD separation analysis (unified vs PD, P:D ratio sweep, transfer strategies)
 python main.py --pd
+
+# Replay a production-style Azure LLM trace instead of a synthetic trace
+python main.py --pd \
+  --workload-trace /path/to/AzureLLMInferenceTrace_code.csv \
+  --workload-format azure \
+  --no-plot --skip-context-sweep
 ```
+
+---
+
+## Real Workload Traces
+
+`trace/workload.py` loads public production-style LLM traces into the same
+`Request` objects used by the synthetic generator. Timestamps are normalized to
+milliseconds, input tokens become prompt KV blocks, and per-request output
+tokens drive PD decode length when present.
+
+Supported schemas:
+
+| Source | Useful fields | Notes |
+|--------|---------------|-------|
+| [BurstGPT](https://github.com/HPMLL/BurstGPT) | `Timestamp`, `Session ID`, `Model`, `Request tokens`, `Response tokens` | Real Azure-powered ChatGPT/GPT-4 workload; session IDs preserve conversation prefix reuse when present. |
+| [Azure LLM Inference 2023/2024](https://github.com/Azure/AzurePublicDataset) | `TIMESTAMP`, `ContextTokens`, `GeneratedTokens` | Production Azure traces used by Splitwise and DynamoLLM; no prompt text, only token counts. |
+| [Mooncake traces](https://huggingface.co/datasets/valeriol29/mooncake-traces) | `timestamp`, `input_length`, `output_length`, `hash_ids` | Best fit for KV-cache experiments because `hash_ids` preserve prefix-sharing relationships. |
+| [SplitwiseSim](https://github.com/mutinifni/splitwise-sim) | `arrival_timestamp`, `prompt_size`, `token_size` | Compatible with Splitwise-style generated traces. |
+
+Examples:
+
+```bash
+# BurstGPT CSV, excluding failed rows with zero response tokens by default
+python main.py --pd \
+  --workload-trace /path/to/BurstGPT_1.csv \
+  --workload-format burstgpt \
+  --workload-limit 4000 \
+  --no-plot --skip-context-sweep
+
+# Mooncake-style JSONL/CSV with hash_ids
+python main.py --cluster \
+  --workload-trace /path/to/mooncake.jsonl \
+  --workload-format mooncake \
+  --workload-time-unit ms \
+  --no-plot --skip-context-sweep
+```
+
+If a trace has `hash_ids`, the loader uses them as the actual KV block IDs.
+Otherwise it synthesizes deterministic block IDs from `session_id` when present
+and falls back to unique per-request blocks. This keeps token-count-only traces
+useful without pretending they contain exact prefix-sharing metadata.
 
 ---
 
@@ -111,6 +158,7 @@ kvcache-sim/
 │   ├── router.py         # Prefix trie + worker pool router
 │   ├── metrics.py        # Counters, KPIs, matplotlib visualiser
 │   ├── network.py        # Network latency model (intra/cross-rack, P2P RDMA)
+│   ├── calibration.py    # External benchmark/simulator profile overlays
 │   ├── cluster.py        # GPUNode, EICPool, Rack, Cluster, ClusterRouter
 │   ├── radix_tree.py     # KV cache radix tree (prefix sharing, ref counting)
 │   ├── pd_nodes.py       # PrefillNode, DecodeNode, compute models
@@ -120,6 +168,7 @@ kvcache-sim/
 │   └── kv_transfer.py    # KV transfer protocol (push/pull/pipeline)
 ├── trace/
 │   ├── generator.py      # Synthetic multi-turn trace (shared system prompts)
+│   ├── workload.py       # Public CSV/JSONL workload loader
 │   ├── replay.py         # Single-node trace replay
 │   ├── cluster_replay.py # Cluster-scale trace replay
 │   └── pd_replay.py      # PD-separated trace replay
@@ -130,7 +179,10 @@ kvcache-sim/
 ├── experiments/
 │   ├── run_all.py        # Single-node + cluster experiments
 │   ├── pd_experiments.py # PD separation experiments
+│   ├── network_variance.py # Jitter/contention sensitivity experiments
 │   └── plot.py           # matplotlib comparison plots
+├── profiles/
+│   └── h100_70b_reference.yaml # Example calibrated overlay
 ├── config.yaml           # Full configuration (all three modes)
 ├── requirements.txt
 └── main.py               # Entry point (--cluster / --pd)
@@ -226,6 +278,39 @@ pd_separation:
     rdma_bw_gbps: 12.5           # effective GB/s for 100 Gbps RDMA
     pipelining: true
 ```
+
+### Calibration Profiles
+
+This simulator is intentionally system-level. It should not embed slow
+cycle-level GPU, DRAM, or SSD simulators in the main replay loop. Instead, run
+microbenchmarks or external simulators offline, then overlay their calibrated
+parameters:
+
+```bash
+python main.py --config config.yaml \
+  --calibration-profile profiles/h100_70b_reference.yaml --pd
+
+python -m experiments.network_variance \
+  --config config.yaml \
+  --calibration-profile profiles/h100_70b_reference.yaml
+```
+
+Supported overlay sections are `hardware`, `cache`, `cluster`, and
+`pd_separation`. Unknown sections are rejected so typoed calibration keys do not
+silently change nothing.
+
+Recommended calibration sources:
+
+| Layer | Use in this repo | External source |
+|-------|------------------|-----------------|
+| LLM operator timing | `pd_separation.compute.*` | Vidur-style profiling or real serving traces |
+| GPU/HBM bandwidth | `hardware.hbm`, `cluster.gpu` | Accel-Sim for kernels, plus bandwidth microbenchmarks |
+| CPU DRAM/HBM details | `hardware.dram`, EIC params | Ramulator2 or DRAMsim3 |
+| SSD/NVMe | `hardware.ssd` | MQSim or SimpleSSD |
+| Network/RDMA/NVLink | `cluster.network`, transfer params | RDMA/NVLink microbenchmarks, ASTRA-sim/ns-3 for topology effects |
+
+The default profile in `profiles/h100_70b_reference.yaml` mirrors the default
+configuration and documents the expected shape for calibrated values.
 
 ---
 

@@ -93,6 +93,38 @@ def compact_pd_config(cfg: dict, num_requests: int) -> dict:
     return out
 
 
+def load_workload_requests(cfg: dict, args, limit: int):
+    if not args.workload_trace:
+        return None
+
+    from trace.workload import load_workload_trace, summarize_workload
+
+    compute = cfg.get("pd_separation", {}).get("compute", {})
+    workload = load_workload_trace(
+        args.workload_trace,
+        block_size_bytes=cfg.get("cache", {}).get("block_size_bytes", 4096),
+        kv_bytes_per_token=compute.get("kv_bytes_per_token"),
+        tokens_per_block=compute.get("tokens_per_block", 16),
+        format_name=args.workload_format,
+        limit=args.workload_limit or limit,
+        timestamp_unit=args.workload_time_unit,
+        arrival_scale=args.workload_arrival_scale,
+        include_failed=args.workload_include_failed,
+        hash_tokens_per_block=args.workload_hash_tokens_per_block,
+    )
+    summary = summarize_workload(workload)
+    if not workload.requests:
+        raise ValueError(f"No usable workload requests loaded from {args.workload_trace}")
+
+    print(
+        f"workload: {summary['requests']} requests from {args.workload_trace} "
+        f"[format={summary['format']}, rps={summary['rps']:.2f}, "
+        f"prompt_p95={summary['prompt_p95']:.0f}, "
+        f"hash_backed={summary['hash_backed']}]"
+    )
+    return workload.requests
+
+
 def run_transfer_microbenchmark(cfg: dict) -> None:
     print("\n[1/3] Transfer microbenchmark: 64 simultaneous same-rack RDMA KV transfers")
     print("variant              p50_ms     p95_ms     p99_ms    max_ms")
@@ -123,21 +155,29 @@ def run_transfer_microbenchmark(cfg: dict) -> None:
         )
 
 
-def run_pd_variants(cfg: dict, num_requests: int, warmup: int) -> None:
+def run_pd_variants(
+    cfg: dict,
+    num_requests: int,
+    warmup: int,
+    requests=None,
+) -> None:
     print("\n[2/3] PD end-to-end replay under network variants")
     base_cfg = compact_pd_config(cfg, num_requests)
-    pt = base_cfg["pd_trace"]
-    requests = TraceGenerator(
-        num_sessions=pt["num_sessions"],
-        turns_per_session=pt["turns_per_session"],
-        prompt_tokens_min=pt["prompt_tokens_min"],
-        prompt_tokens_max=pt["prompt_tokens_max"],
-        initial_context_tokens=pt["initial_context_tokens"],
-        qps=pt["qps"],
-        block_size_bytes=base_cfg.get("cache", {}).get("block_size_bytes", 4096),
-        num_system_prompts=pt["num_system_prompts"],
-        seed=pt["seed"],
-    ).generate()[:num_requests]
+    if requests is None:
+        pt = base_cfg["pd_trace"]
+        requests = TraceGenerator(
+            num_sessions=pt["num_sessions"],
+            turns_per_session=pt["turns_per_session"],
+            prompt_tokens_min=pt["prompt_tokens_min"],
+            prompt_tokens_max=pt["prompt_tokens_max"],
+            initial_context_tokens=pt["initial_context_tokens"],
+            qps=pt["qps"],
+            block_size_bytes=base_cfg.get("cache", {}).get("block_size_bytes", 4096),
+            num_system_prompts=pt["num_system_prompts"],
+            seed=pt["seed"],
+        ).generate()[:num_requests]
+    else:
+        requests = requests[:num_requests]
 
     print(f"trace: {len(requests)} requests, warmup={warmup}")
     print(
@@ -213,13 +253,37 @@ def run_transfer_sensitive_pd(cfg: dict) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--calibration-profile", default=None)
     parser.add_argument("--pd-requests", type=int, default=800)
     parser.add_argument("--warmup", type=int, default=80)
+    parser.add_argument("--workload-trace", default=None)
+    parser.add_argument(
+        "--workload-format",
+        choices=("auto", "burstgpt", "azure", "mooncake", "splitwise", "generic"),
+        default="auto",
+    )
+    parser.add_argument("--workload-limit", type=int, default=None)
+    parser.add_argument(
+        "--workload-time-unit",
+        choices=("auto", "s", "ms", "us", "ns"),
+        default="auto",
+    )
+    parser.add_argument("--workload-arrival-scale", type=float, default=1.0)
+    parser.add_argument("--workload-include-failed", action="store_true")
+    parser.add_argument("--workload-hash-tokens-per-block", type=int, default=None)
     args = parser.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text())
+    if args.calibration_profile:
+        from sim.calibration import apply_calibration_profile, load_calibration_profile
+
+        cfg = apply_calibration_profile(
+            cfg,
+            load_calibration_profile(args.calibration_profile),
+        )
+    requests = load_workload_requests(cfg, args, args.pd_requests)
     run_transfer_microbenchmark(cfg)
-    run_pd_variants(cfg, args.pd_requests, args.warmup)
+    run_pd_variants(cfg, args.pd_requests, args.warmup, requests=requests)
     run_transfer_sensitive_pd(cfg)
 
 

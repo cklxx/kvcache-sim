@@ -19,6 +19,65 @@ def _load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def _tokens_per_block(cfg: dict) -> int:
+    return int(
+        cfg.get("pd_separation", {})
+        .get("compute", {})
+        .get("tokens_per_block", 16)
+    )
+
+
+def _kv_bytes_per_token(cfg: dict) -> int | None:
+    value = (
+        cfg.get("pd_separation", {})
+        .get("compute", {})
+        .get("kv_bytes_per_token")
+    )
+    return int(value) if value is not None else None
+
+
+def _load_workload_requests(cfg: dict, args, limit: int | None):
+    if not args.workload_trace:
+        return None
+
+    from trace.workload import load_workload_trace, summarize_workload
+
+    load_limit = args.workload_limit if args.workload_limit is not None else limit
+    workload = load_workload_trace(
+        args.workload_trace,
+        block_size_bytes=cfg.get("cache", {}).get("block_size_bytes", 4096),
+        kv_bytes_per_token=_kv_bytes_per_token(cfg),
+        tokens_per_block=_tokens_per_block(cfg),
+        format_name=args.workload_format,
+        limit=load_limit,
+        timestamp_unit=args.workload_time_unit,
+        arrival_scale=args.workload_arrival_scale,
+        include_failed=args.workload_include_failed,
+        hash_tokens_per_block=args.workload_hash_tokens_per_block,
+    )
+    summary = summarize_workload(workload)
+    if not workload.requests:
+        raise ValueError(f"No usable workload requests loaded from {args.workload_trace}")
+
+    prompt = (
+        f"prompt_avg={summary['prompt_avg']:.0f}, "
+        f"prompt_p95={summary['prompt_p95']:.0f}"
+    )
+    output = ""
+    if "output_avg" in summary:
+        output = (
+            f", output_avg={summary['output_avg']:.0f}, "
+            f"output_p95={summary['output_p95']:.0f}"
+        )
+    hash_note = "hash_ids" if summary.get("hash_backed") else "synthetic_prefix"
+    print(
+        f"[workload] Loaded {summary['requests']} requests from {args.workload_trace} "
+        f"[format={summary['format']}, {prompt}{output}, "
+        f"rps={summary['rps']:.2f}, {hash_note}, skipped={summary['skipped_rows']}]"
+    )
+    return workload.requests
+
+
 # ======================================================================
 # Table printers
 # ======================================================================
@@ -183,18 +242,26 @@ def run_single_node(cfg: dict, args) -> None:
     # 1. Config
     print(f"\n[1/5] Loaded config: {args.config}")
 
-    # 2. Trace
-    from trace.generator import TraceGenerator
-    gen = TraceGenerator.from_config(cfg)
-    t0 = time.perf_counter()
-    requests = gen.generate()
-    elapsed = time.perf_counter() - t0
-
-    num_req = cfg.get("experiments", {}).get("num_requests", len(requests))
-    requests = requests[:num_req]
+    num_req = cfg.get("experiments", {}).get("num_requests")
     warmup = cfg.get("experiments", {}).get("warmup_requests", 200)
-    print(f"[2/5] Generated {len(requests)} requests ({elapsed:.2f}s)  "
-          f"[warmup={warmup}, sessions={gen.num_sessions}]")
+
+    # 2. Trace
+    requests = _load_workload_requests(cfg, args, num_req)
+    if requests is None:
+        from trace.generator import TraceGenerator
+        gen = TraceGenerator.from_config(cfg)
+        t0 = time.perf_counter()
+        requests = gen.generate()
+        elapsed = time.perf_counter() - t0
+        if num_req is not None:
+            requests = requests[:num_req]
+        print(f"[2/5] Generated {len(requests)} requests ({elapsed:.2f}s)  "
+              f"[warmup={warmup}, sessions={gen.num_sessions}]")
+    else:
+        if num_req is not None:
+            requests = requests[:num_req]
+        print(f"[2/5] Using workload trace ({len(requests)} requests)  "
+              f"[warmup={warmup}]")
 
     # 3. Learned model
     learned_model = None
@@ -334,28 +401,35 @@ def run_pd(cfg: dict, args) -> None:
     cluster = build_pd_cluster(cfg, pd_cfg)
     print(f"\n  {cluster.summary()}")
 
-    # 1. Generate trace
-    gen = TraceGenerator(
-        num_sessions=pt.get("num_sessions", 3000),
-        turns_per_session=pt.get("turns_per_session", 5),
-        prompt_tokens_min=pt.get("prompt_tokens_min", 128),
-        prompt_tokens_max=pt.get("prompt_tokens_max", 2048),
-        initial_context_tokens=pt.get("initial_context_tokens", 1024),
-        num_system_prompts=pt.get("num_system_prompts", 20),
-        qps=pt.get("qps", 300.0),
-        block_size_bytes=cfg.get("cache", {}).get("block_size_bytes", 4096),
-        seed=pt.get("seed", 42),
-    )
-    t0 = time.perf_counter()
-    requests = gen.generate()
-    elapsed = time.perf_counter() - t0
-
-    num_req = pe.get("num_requests", len(requests))
-    requests = requests[:num_req]
+    num_req = pe.get("num_requests")
     warmup = pe.get("warmup_requests", 500)
+    requests = _load_workload_requests(cfg, args, num_req)
+    if requests is None:
+        # 1. Generate trace
+        gen = TraceGenerator(
+            num_sessions=pt.get("num_sessions", 3000),
+            turns_per_session=pt.get("turns_per_session", 5),
+            prompt_tokens_min=pt.get("prompt_tokens_min", 128),
+            prompt_tokens_max=pt.get("prompt_tokens_max", 2048),
+            initial_context_tokens=pt.get("initial_context_tokens", 1024),
+            num_system_prompts=pt.get("num_system_prompts", 20),
+            qps=pt.get("qps", 300.0),
+            block_size_bytes=cfg.get("cache", {}).get("block_size_bytes", 4096),
+            seed=pt.get("seed", 42),
+        )
+        t0 = time.perf_counter()
+        requests = gen.generate()
+        elapsed = time.perf_counter() - t0
+        if num_req is not None:
+            requests = requests[:num_req]
+        trace_msg = f"Generated {len(requests)} requests ({elapsed:.2f}s)"
+    else:
+        if num_req is not None:
+            requests = requests[:num_req]
+        trace_msg = f"Using workload trace ({len(requests)} requests)"
     avg_blocks = sum(len(r.block_hashes) for r in requests) / max(len(requests), 1)
 
-    print(f"\n[1/4] Generated {len(requests)} requests ({elapsed:.2f}s)  "
+    print(f"\n[1/4] {trace_msg}  "
           f"[warmup={warmup}, avg {avg_blocks:.0f} blocks/req]")
 
     runner = PDExperimentRunner(cfg, warmup=warmup)
@@ -487,33 +561,42 @@ def run_cluster(cfg: dict, args) -> None:
           f"Simulating: {total_sim} GPUs ({n_racks} racks × {n_gpus_per_rack})")
     print("=" * 64)
 
-    # ── 1. Generate high-volume trace ────────────────────────────────
-    from trace.generator import TraceGenerator
-    gen = TraceGenerator(
-        num_sessions=ct.get("num_sessions", 5000),
-        turns_per_session=ct.get("turns_per_session", 5),
-        prompt_tokens_min=ct.get("prompt_tokens_min", 64),
-        prompt_tokens_max=ct.get("prompt_tokens_max", 512),
-        initial_context_tokens=ct.get("initial_context_tokens", 128),
-        num_system_prompts=ct.get("num_system_prompts", 20),
-        num_shared_docs=ct.get("num_shared_docs", 0),
-        num_rag_chunks=ct.get("num_rag_chunks", 3),
-        doc_zipf_alpha=ct.get("doc_zipf_alpha", 1.1),
-        qps=ct.get("qps", 500.0),
-        block_size_bytes=cfg.get("cache", {}).get("block_size_bytes", 4096),
-        seed=ct.get("seed", 42),
-    )
-    t0 = time.perf_counter()
-    requests = gen.generate()
-    elapsed = time.perf_counter() - t0
-
-    num_req = ce.get("num_requests", len(requests))
-    requests = requests[:num_req]
+    num_req = ce.get("num_requests")
     warmup = ce.get("warmup_requests", 1000)
+    requests = _load_workload_requests(cfg, args, num_req)
+    if requests is None:
+        # ── 1. Generate high-volume trace ────────────────────────────────
+        from trace.generator import TraceGenerator
+        gen = TraceGenerator(
+            num_sessions=ct.get("num_sessions", 5000),
+            turns_per_session=ct.get("turns_per_session", 5),
+            prompt_tokens_min=ct.get("prompt_tokens_min", 64),
+            prompt_tokens_max=ct.get("prompt_tokens_max", 512),
+            initial_context_tokens=ct.get("initial_context_tokens", 128),
+            num_system_prompts=ct.get("num_system_prompts", 20),
+            num_shared_docs=ct.get("num_shared_docs", 0),
+            num_rag_chunks=ct.get("num_rag_chunks", 3),
+            doc_zipf_alpha=ct.get("doc_zipf_alpha", 1.1),
+            qps=ct.get("qps", 500.0),
+            block_size_bytes=cfg.get("cache", {}).get("block_size_bytes", 4096),
+            seed=ct.get("seed", 42),
+        )
+        t0 = time.perf_counter()
+        requests = gen.generate()
+        elapsed = time.perf_counter() - t0
+        if num_req is not None:
+            requests = requests[:num_req]
+        trace_msg = (
+            f"Generated {len(requests)} requests ({elapsed:.2f}s)  "
+            f"[sessions={gen.num_sessions}, sys_prompts={gen.num_system_prompts}, "
+            f"shared_docs={gen.num_shared_docs}]"
+        )
+    else:
+        if num_req is not None:
+            requests = requests[:num_req]
+        trace_msg = f"Using workload trace ({len(requests)} requests) [warmup={warmup}]"
 
-    print(f"\n[1/4] Generated {len(requests)} requests ({elapsed:.2f}s)  "
-          f"[sessions={gen.num_sessions}, sys_prompts={gen.num_system_prompts}, "
-          f"shared_docs={gen.num_shared_docs}]")
+    print(f"\n[1/4] {trace_msg}")
 
     # ── 2. EIC sizing experiments ────────────────────────────────────
     print(f"\n[2/4] EIC Sizing Experiments (warmup={warmup}):")
@@ -607,9 +690,68 @@ def main() -> None:
         action="store_true",
         help="Skip long context-length sweeps in cluster/PD modes",
     )
+    parser.add_argument(
+        "--calibration-profile",
+        default=None,
+        help="YAML profile that overlays externally calibrated hardware/network parameters",
+    )
+    parser.add_argument(
+        "--workload-trace",
+        default=None,
+        help="CSV/JSON/JSONL production-style workload trace to replay instead of synthetic trace",
+    )
+    parser.add_argument(
+        "--workload-format",
+        choices=("auto", "burstgpt", "azure", "mooncake", "splitwise", "generic"),
+        default="auto",
+        help="External workload schema hint; auto detects common public traces",
+    )
+    parser.add_argument(
+        "--workload-limit",
+        type=int,
+        default=None,
+        help="Maximum usable workload rows to load; defaults to the mode's num_requests",
+    )
+    parser.add_argument(
+        "--workload-time-unit",
+        choices=("auto", "s", "ms", "us", "ns"),
+        default="auto",
+        help="Unit for numeric workload timestamps; datetimes are parsed automatically",
+    )
+    parser.add_argument(
+        "--workload-arrival-scale",
+        type=float,
+        default=1.0,
+        help="Scale request rate; 2.0 doubles RPS, 0.5 halves RPS",
+    )
+    parser.add_argument(
+        "--workload-include-failed",
+        action="store_true",
+        help="Keep rows with zero output tokens, such as failed BurstGPT requests",
+    )
+    parser.add_argument(
+        "--workload-hash-tokens-per-block",
+        type=int,
+        default=None,
+        help="Token span represented by each workload hash_id; Mooncake defaults to 512",
+    )
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
+    if args.calibration_profile:
+        from sim.calibration import (
+            apply_calibration_profile,
+            load_calibration_profile,
+            profile_name,
+        )
+
+        profile = load_calibration_profile(args.calibration_profile)
+        cfg = apply_calibration_profile(cfg, profile)
+        print(
+            f"[calibration] Applied profile "
+            f"{profile_name(profile, args.calibration_profile)} "
+            f"({args.calibration_profile})"
+        )
 
     if args.pd:
         run_pd(cfg, args)

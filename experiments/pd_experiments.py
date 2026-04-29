@@ -54,7 +54,7 @@ def _unified_baseline_metrics(
     rr = 0
 
     pd = PDMetrics()
-    pd.total_requests = base_metrics.total_requests
+    pd.total_requests = max(0, len(requests) - warmup)
     pd.prefill_cache = base_metrics
 
     for req in requests[warmup:]:
@@ -78,8 +78,9 @@ def _unified_baseline_metrics(
         new_tokens = (n_blocks - cached) * compute_cfg.tokens_per_block
         prefill_ms = new_tokens * compute_cfg.prefill_ms_per_token
         # Unified decode: no continuous batching benefit (GPU is dedicated)
+        output_tokens = req.output_tokens if req.output_tokens > 0 else max_output_tokens
         first_decode_ms = compute_cfg.decode_ms_per_token
-        decode_total_ms = max_output_tokens * first_decode_ms
+        decode_total_ms = output_tokens * first_decode_ms
 
         # GPU is busy for prefill + ALL decode (head-of-line blocking!)
         service_time = prefill_ms + decode_total_ms

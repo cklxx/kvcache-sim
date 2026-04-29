@@ -24,12 +24,15 @@ from typing import List, Optional
 
 @dataclass
 class Request:
+    """Simulator request. ``timestamp`` is milliseconds from trace start."""
+
     session_id: str
     turn_id: int
     timestamp: float
     block_hashes: List[str]
     block_size: int = 4096
     prompt_tokens: int = 0
+    output_tokens: int = 0
 
 
 # ── Block hashing ────────────────────────────────────────────────────
@@ -191,7 +194,7 @@ class TraceGenerator:
                 if not block_hashes:
                     continue
 
-                inter_arrival = self.rng.expovariate(self.qps)
+                inter_arrival = self.rng.expovariate(self.qps) * 1000.0
                 current_time += inter_arrival
 
                 requests.append(
@@ -343,7 +346,7 @@ class AgentTraceGenerator:
                 if not block_hashes:
                     continue
 
-                inter_arrival = self.rng.expovariate(self.qps)
+                inter_arrival = self.rng.expovariate(self.qps) * 1000.0
                 current_time += inter_arrival
 
                 requests.append(

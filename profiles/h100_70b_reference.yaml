@@ -1,0 +1,67 @@
+name: h100_70b_reference
+description: >
+  Example externally calibrated profile for a 70B-serving H100-class system.
+  Values here mirror the default config and show the supported overlay shape.
+sources:
+  gpu_compute: "Offline benchmark or Vidur-style operator profile"
+  hbm_dram: "Ramulator/DRAMSim or bandwidth microbenchmark"
+  ssd: "MQSim/SimpleSSD or fio/NVMe microbenchmark"
+  network: "RDMA/NVLink microbenchmark or ns-3/Astra-sim calibration"
+
+overrides:
+  hardware:
+    hbm:
+      capacity_gb: 5
+      read_bw_gbps: 3350
+      write_bw_gbps: 3350
+      read_latency_ms: 0.001
+    dram:
+      capacity_gb: 256
+      read_bw_gbps: 200
+      write_bw_gbps: 200
+      read_latency_ms: 0.1
+    ssd:
+      capacity_gb: 3200
+      read_bw_gbps: 7
+      write_bw_gbps: 4
+      read_latency_ms: 0.5
+  cluster:
+    gpu:
+      hbm_capacity_gb: 5
+      hbm_read_bw_gbps: 3350
+      hbm_write_bw_gbps: 3350
+      hbm_latency_ms: 0.001
+    eic:
+      read_bw_gbps: 100
+      write_bw_gbps: 80
+      access_latency_ms: 0.005
+    network:
+      intra_rack_latency_us: 3
+      cross_rack_latency_us: 15
+      remote_ssd_latency_us: 200
+      p2p_rdma_bw_gbps: 100
+      p2p_rdma_latency_us: 5
+      nvlink_bw_gbps: 900
+      nvlink_latency_us: 1
+      gpus_per_node: 8
+      jitter_cv: 0.0
+      tail_jitter_prob: 0.0
+      tail_jitter_multiplier: 1.0
+      contention_enabled: false
+      seed: 42
+  pd_separation:
+    compute:
+      prefill_tflops: 800
+      decode_memory_bw_gbps: 3350
+      model_params_b: 70
+      kv_bytes_per_token: 327680
+      tokens_per_block: 16
+      overhead_factor: 1.0
+      prefill_batch_efficiency: 0.85
+      decode_kv_overhead_factor: 0.02
+    transfer:
+      rdma_bw_gbps: 12.5
+      rdma_latency_us: 5
+      pipelining: true
+      pipeline_chunk_blocks: 16
+      compression_ratio: 1.0
