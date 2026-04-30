@@ -486,15 +486,15 @@ def build_cluster(
     Construct a Cluster from a config dict.
 
     The config describes the full 万卡 cluster; we simulate a
-    representative subset controlled by ``simulate_racks`` and
-    ``simulate_gpus_per_rack``.
+    cluster by default. Smaller experiments can still override
+    ``simulate_racks`` and ``simulate_gpus_per_rack``.
     """
     cc = cfg.get("cluster", {})
     gpu_cfg = cc.get("gpu", {})
     eic_cfg = cc.get("eic", {})
 
-    n_racks = cc.get("simulate_racks", 8)
-    n_gpus = cc.get("simulate_gpus_per_rack", 16)
+    n_racks = cc.get("simulate_racks", 160)
+    n_gpus = cc.get("simulate_gpus_per_rack", 64)
     eic_nodes = eic_cfg.get("nodes_per_rack", 4)
 
     network = NetworkModel.from_config(cfg)

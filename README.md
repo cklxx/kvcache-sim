@@ -26,7 +26,7 @@ Three simulation modes:
 ### Cluster Mode (万卡 + EIC)
 
 ```
-  Cluster: 10,240 GPUs  (simulating 128 = 8 racks × 16 GPUs)
+  Cluster: 10,240 GPUs  (simulating full 160 racks × 64 GPUs)
   ┌──────────────────────────────────────────────────────────────────┐
   │  ClusterRouter (session affinity + prefix scoring)               │
   ├──────────────────────────────────────────────────────────────────┤
@@ -49,7 +49,7 @@ Three simulation modes:
 ### PD Separation Mode
 
 ```
-  PDCluster: 128 GPUs (32 Prefill + 96 Decode, P:D = 1:3)
+  PDCluster: 10,240 GPUs (2,560 Prefill + 7,680 Decode, P:D = 1:3)
   ┌──────────────────────────────────────────────────────────────────┐
   │                                                                  │
   │  Request ──▶ PrefillRouter ──▶ PrefillNode                      │
@@ -229,7 +229,7 @@ In **unified** serving, a GPU does prefill (process prompt) then decode (generat
 ```
 ================================================================
   kvcache-sim  —  PD Separation Mode
-  PDCluster: 128 GPUs (32P + 96D, ratio 1:3) × 8 racks
+  PDCluster: 10,240 GPUs (2,560P + 7,680D, ratio 1:3) × 160 racks
 ================================================================
 
 The exact numbers are workload-dependent. The PD replayer now keeps decode

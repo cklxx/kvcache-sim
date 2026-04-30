@@ -218,7 +218,7 @@ def _print_credibility_report(cfg: dict, cluster) -> None:
     hbm_gb = gpu_cfg.get("hbm_capacity_gb", 0.003)
     eic_per_node_gb = eic_cfg.get("capacity_per_node_gb", 0.02)
     eic_nodes = eic_cfg.get("nodes_per_rack", 4)
-    gpus_per_rack = cc.get("simulate_gpus_per_rack", 16)
+    gpus_per_rack = cc.get("simulate_gpus_per_rack", 64)
     eic_per_gpu = eic_per_node_gb * eic_nodes / gpus_per_rack
     block_size_mb = cfg.get("cache", {}).get("block_size_bytes", 4096) / (1024 * 1024)
     tokens_per_block = (
@@ -624,8 +624,8 @@ def run_cluster(cfg: dict, args) -> None:
     ct = cfg.get("cluster_trace", cfg.get("trace", {}))
     ce = cfg.get("cluster_experiments", cfg.get("experiments", {}))
 
-    n_racks = cc.get("simulate_racks", 8)
-    n_gpus_per_rack = cc.get("simulate_gpus_per_rack", 16)
+    n_racks = cc.get("simulate_racks", 160)
+    n_gpus_per_rack = cc.get("simulate_gpus_per_rack", 64)
     total_sim = n_racks * n_gpus_per_rack
     full_cluster = cc.get("total_gpus", 10240)
 

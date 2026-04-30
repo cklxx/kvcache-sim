@@ -48,9 +48,9 @@ cluster:
   total_gpus: 10240             # 10K GPUs total
   gpus_per_rack: 64             # production rack density
 
-  # Simulation subset
-  simulate_racks: 8
-  simulate_gpus_per_rack: 16    # 8×16 = 128 GPUs simulated
+  # Simulation scale: full 万卡 cluster by default
+  simulate_racks: 160
+  simulate_gpus_per_rack: 64    # 160×64 = 10,240 GPUs simulated
 
   gpu:
     hbm_capacity_gb: 5          # KV budget for 70B model (80GB - 65GB weights - 10GB activations)

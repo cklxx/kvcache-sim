@@ -196,8 +196,8 @@ def build_pd_cluster(
     gpu_cfg = cc.get("gpu", {})
     eic_cfg = cc.get("eic", {})
 
-    n_racks = cc.get("simulate_racks", 8)
-    n_gpus_per_rack = cc.get("simulate_gpus_per_rack", 16)
+    n_racks = cc.get("simulate_racks", 160)
+    n_gpus_per_rack = cc.get("simulate_gpus_per_rack", 64)
     eic_nodes = eic_cfg.get("nodes_per_rack", 4)
 
     network = NetworkModel.from_config(cfg)
