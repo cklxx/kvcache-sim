@@ -76,7 +76,9 @@ def test_load_mooncake_jsonl_preserves_hash_ids_and_hash_block_size(tmp_path) ->
     assert trace.format_name == "mooncake"
     assert trace.used_hash_ids
     assert trace.hash_tokens_per_block == 512
+    assert trace.hash_backed_requests == 2
     assert [r.timestamp for r in trace.requests] == [0.0, 3000.0]
     assert trace.requests[0].block_hashes == ["mooncake:h:0", "mooncake:h:1"]
     assert trace.requests[0].block_size == 5120
     assert summary["hash_backed"] is True
+    assert summary["hash_id_coverage"] == 1.0

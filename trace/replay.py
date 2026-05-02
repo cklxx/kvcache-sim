@@ -36,9 +36,11 @@ class TraceReplayer:
 
         # Seed only explicit offline oracles. SessionAwarePrefetch learns
         # online below after each request has completed.
-        for w in self.router.workers:
-            if isinstance(w.cache.eviction, BeladyOracle):
-                _seed_belady(w.cache.eviction, requests)
+        _seed_belady_policies(
+            [w.cache.eviction for w in self.router.workers
+             if isinstance(w.cache.eviction, BeladyOracle)],
+            requests,
+        )
 
         # Reset all worker metrics
         for w in self.router.workers:
@@ -78,11 +80,31 @@ class TraceReplayer:
 # ======================================================================
 
 
-def _seed_belady(policy: BeladyOracle, requests: List[Request]) -> None:
-    """Populate future_access_map from the full trace."""
+def _build_belady_future(requests: List[Request]) -> dict:
     from collections import defaultdict
     future: dict = defaultdict(list)
     for req in requests:
         for bh in req.block_hashes:
             future[bh].append(req.timestamp)
-    policy._future = {k: sorted(v) for k, v in future.items()}
+    return {k: sorted(v) for k, v in future.items()}
+
+
+def _seed_belady_policies(policies: List[BeladyOracle], requests: List[Request]) -> None:
+    if not policies:
+        return
+
+    shared_future = next(
+        (p._future for p in policies if getattr(p, "_future", None)),
+        None,
+    )
+    if shared_future is None:
+        shared_future = _build_belady_future(requests)
+
+    for policy in policies:
+        if not getattr(policy, "_future", None):
+            policy._future = shared_future
+
+
+def _seed_belady(policy: BeladyOracle, requests: List[Request]) -> None:
+    """Populate future_access_map from the full trace."""
+    policy._future = _build_belady_future(requests)

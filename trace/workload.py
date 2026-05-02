@@ -75,6 +75,7 @@ class WorkloadTrace:
     skipped_rows: int = 0
     used_hash_ids: bool = False
     hash_tokens_per_block: int | None = None
+    hash_backed_requests: int = 0
 
 
 def load_workload_trace(
@@ -115,6 +116,7 @@ def load_workload_trace(
     skipped = 0
     source_rows = 0
     used_hash_ids = False
+    hash_backed_requests = 0
     session_turns: dict[str, int] = {}
 
     for source_idx, row in enumerate(_iter_rows(path)):
@@ -168,6 +170,7 @@ def load_workload_trace(
                 skipped += 1
                 continue
             used_hash_ids = True
+            hash_backed_requests += 1
             request_block_size = _block_size_for_hash_ids(
                 block_size_bytes,
                 kv_bytes_per_token,
@@ -222,6 +225,7 @@ def load_workload_trace(
         skipped_rows=skipped,
         used_hash_ids=used_hash_ids,
         hash_tokens_per_block=hash_block_tokens if used_hash_ids else None,
+        hash_backed_requests=hash_backed_requests,
     )
 
 
@@ -250,6 +254,11 @@ def summarize_workload(trace: WorkloadTrace) -> dict[str, Any]:
         "prompt_p95": _percentile(prompts, 95),
         "skipped_rows": trace.skipped_rows,
         "hash_backed": trace.used_hash_ids,
+        "hash_id_coverage": (
+            trace.hash_backed_requests / len(requests)
+            if trace.hash_backed_requests
+            else (1.0 if trace.used_hash_ids else 0.0)
+        ),
     }
     if outputs:
         summary.update(

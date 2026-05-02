@@ -97,6 +97,11 @@ python main.py --cluster
 # PD separation analysis (unified vs PD, P:D ratio sweep, transfer strategies)
 python main.py --pd
 
+# Fast smoke run with machine-readable reports
+python main.py --cluster --preset smoke \
+  --report-json results/smoke_cluster.json \
+  --report-csv results/smoke_cluster.csv
+
 # Replay a production-style Azure LLM trace instead of a synthetic trace
 python main.py --pd \
   --workload-trace /path/to/AzureLLMInferenceTrace_code.csv \
@@ -144,6 +149,33 @@ If a trace has `hash_ids`, the loader uses them as the actual KV block IDs.
 Otherwise it synthesizes deterministic block IDs from `session_id` when present
 and falls back to unique per-request blocks. This keeps token-count-only traces
 useful without pretending they contain exact prefix-sharing metadata.
+
+---
+
+## Production Evaluation Workflow
+
+Use presets for repeatable run scale:
+
+- `--preset smoke`: small, fast CI/sanity run; disables training, plots, and context sweeps.
+- `--preset dev`: medium local run; disables plots and context sweeps.
+- `--preset prod-eval`: keeps the configured production-scale values.
+
+For production-adjacent runs, prefer:
+
+```bash
+python main.py --cluster --preset prod-eval \
+  --calibration-profile profiles/h100_70b_reference.yaml \
+  --workload-trace /path/to/mooncake.jsonl \
+  --workload-format mooncake \
+  --strict-workload-validation \
+  --report-json results/prod_eval_cluster.json \
+  --report-csv results/prod_eval_cluster.csv \
+  --no-plot --skip-context-sweep
+```
+
+Reports include run metadata, the full config snapshot, calibration readiness,
+workload validation, cluster diagnostics, and serialized result metrics.
+`PRODUCTION_READINESS.md` describes acceptance gates and confidence levels.
 
 ---
 

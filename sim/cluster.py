@@ -144,6 +144,7 @@ class GPUNode:
         self.selective_write = selective_write
         self.selective_write_depth = selective_write_depth
         self.metrics = Metrics(tier_names=["HBM", "EIC", "Remote"])
+        self.processed_requests: int = 0
         self._pending_eic: List[Tuple[KVBlock, float]] = []
         self._ever_computed: set = set()  # track all blocks ever computed on this GPU
 
@@ -255,6 +256,7 @@ class GPUNode:
         session_id: str,
         current_time: float,
     ) -> Tuple[int, float]:
+        self.processed_requests += 1
         hits = 0
         total_lat = 0.0
         for depth, bh in enumerate(block_hashes):
@@ -289,6 +291,7 @@ class GPUNode:
 
     def reset_metrics(self) -> None:
         self.metrics = Metrics(tier_names=["HBM", "EIC", "Remote"])
+        self.processed_requests = 0
 
 
 # ======================================================================
@@ -389,6 +392,15 @@ class Cluster:
     @property
     def total_cross_gpu_eic_hits(self) -> int:
         return sum(r.eic.cross_gpu_hits for r in self.racks)
+
+    def request_counts_by_gpu(self) -> Dict[int, int]:
+        return {g.gpu_id: g.processed_requests for g in self.all_gpus}
+
+    def request_counts_by_rack(self) -> Dict[int, int]:
+        return {
+            rack.rack_id: sum(g.processed_requests for g in rack.gpu_nodes)
+            for rack in self.racks
+        }
 
     def eic_utilizations(self) -> Dict[int, float]:
         return {r.rack_id: r.eic.utilization for r in self.racks}

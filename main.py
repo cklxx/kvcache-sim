@@ -38,9 +38,12 @@ def _kv_bytes_per_token(cfg: dict) -> int | None:
 
 def _load_workload_requests(cfg: dict, args, limit: int | None):
     if not args.workload_trace:
+        setattr(args, "_workload_summary", None)
+        setattr(args, "_trace_validation", None)
         return None
 
     from trace.workload import load_workload_trace, summarize_workload
+    from trace.validation import validate_workload_trace
 
     load_limit = args.workload_limit if args.workload_limit is not None else limit
     workload = load_workload_trace(
@@ -56,8 +59,32 @@ def _load_workload_requests(cfg: dict, args, limit: int | None):
         hash_tokens_per_block=args.workload_hash_tokens_per_block,
     )
     summary = summarize_workload(workload)
+    validation = validate_workload_trace(workload)
+    report_summary = dict(summary)
+    report_summary.update(
+        {
+            "path": args.workload_trace,
+            "format_arg": args.workload_format,
+            "limit_arg": args.workload_limit,
+            "time_unit_arg": args.workload_time_unit,
+            "arrival_scale_arg": args.workload_arrival_scale,
+            "include_failed_arg": args.workload_include_failed,
+            "hash_tokens_per_block_arg": args.workload_hash_tokens_per_block,
+            "validation": validation,
+        }
+    )
+    setattr(args, "_workload_summary", report_summary)
+    setattr(args, "_trace_validation", validation)
     if not workload.requests:
         raise ValueError(f"No usable workload requests loaded from {args.workload_trace}")
+    if validation["warnings"]:
+        print(f"[workload] Validation warnings: {len(validation['warnings'])}")
+        for message in validation["warnings"][:3]:
+            print(f"  - {message}")
+        if len(validation["warnings"]) > 3:
+            print(f"  - ... {len(validation['warnings']) - 3} more")
+        if args.strict_workload_validation:
+            raise ValueError("workload validation failed; see warnings above")
 
     prompt = (
         f"prompt_avg={summary['prompt_avg']:.0f}, "
@@ -299,12 +326,46 @@ def _learned_training_plan(cfg: dict, args, num_requests: int, warmup: int) -> t
     return mode, train_count, max(warmup, train_count)
 
 
+def _write_reports_if_requested(
+    mode: str,
+    cfg: dict,
+    args,
+    results: dict,
+    started_at: float,
+    run_summary: dict | None = None,
+) -> None:
+    if not args.report_json and not args.report_csv:
+        return
+
+    from sim.reporting import build_report, write_csv_report, write_json_report
+
+    report = build_report(
+        mode=mode,
+        args=args,
+        config_path=args.config,
+        config=cfg,
+        results=results,
+        elapsed_seconds=time.perf_counter() - started_at,
+        argv=sys.argv[1:],
+        calibration_summary=getattr(args, "_calibration_summary", None),
+        workload_summary=getattr(args, "_workload_summary", None),
+        run_summary=run_summary,
+    )
+    if args.report_json:
+        out = write_json_report(report, args.report_json)
+        print(f"[report] JSON saved -> {out}")
+    if args.report_csv:
+        out = write_csv_report(report, args.report_csv)
+        print(f"[report] CSV saved -> {out}")
+
+
 # ======================================================================
 # Single-node mode
 # ======================================================================
 
 
 def run_single_node(cfg: dict, args) -> None:
+    run_started = time.perf_counter()
     print("=" * 64)
     print("  kvcache-sim  —  Single-Node Multi-Tier Demo")
     print("=" * 64)
@@ -376,13 +437,31 @@ def run_single_node(cfg: dict, args) -> None:
     _print_storage_table(results, ["HBM", "DRAM", "SSD"])
 
     # 6. Plot
+    plot_output = None
     if not args.no_plot:
         from experiments.plot import plot_results
-        out = plot_results(
+        plot_output = plot_results(
             results, tier_names=["HBM", "DRAM", "SSD"],
             output_dir=cfg.get("experiments", {}).get("output_dir", "results"),
         )
-        print(f"\nPlot saved → {out}")
+        print(f"\nPlot saved → {plot_output}")
+
+    run_summary = {
+        "request_count": len(requests),
+        "warmup_requests": warmup,
+        "eval_warmup_requests": eval_warmup,
+        "trace_source": "workload" if args.workload_trace else "synthetic",
+        "learned_model_ready": learned_model is not None,
+        "plot_output": plot_output,
+    }
+    _write_reports_if_requested(
+        "single_node",
+        cfg,
+        args,
+        {"policy_results": results},
+        run_started,
+        run_summary,
+    )
 
     print("\nDone.")
 
@@ -461,6 +540,7 @@ def run_pd(cfg: dict, args) -> None:
     from trace.generator import TraceGenerator
     from experiments.pd_experiments import PDExperimentRunner
 
+    run_started = time.perf_counter()
     pd_cfg = PDConfig.from_config(cfg)
     pt = cfg.get("pd_trace", cfg.get("trace", {}))
     pe = cfg.get("pd_experiments", cfg.get("experiments", {}))
@@ -524,6 +604,7 @@ def run_pd(cfg: dict, args) -> None:
     _print_pd_storage_table(transfer_results)
 
     # 5. Context Length Sweep (optional, longer)
+    ctx_results = None
     if not args.no_plot and not args.skip_context_sweep:
         print(f"\n[Bonus] Context Length × PD Benefit:")
         ctx_results = runner.run_context_length_pd()
@@ -534,6 +615,28 @@ def run_pd(cfg: dict, args) -> None:
         out_dir = pe.get("output_dir", "results")
         os.makedirs(out_dir, exist_ok=True)
         _plot_pd_results(uvp_results, ratio_results, transfer_results, out_dir)
+
+    report_results = {
+        "unified_vs_pd": uvp_results,
+        "pd_ratio_sweep": ratio_results,
+        "transfer_strategy": transfer_results,
+    }
+    if ctx_results is not None:
+        report_results["context_sweep"] = ctx_results
+    _write_reports_if_requested(
+        "pd",
+        cfg,
+        args,
+        report_results,
+        run_started,
+        {
+            "request_count": len(requests),
+            "warmup_requests": warmup,
+            "avg_blocks_per_request": avg_blocks,
+            "trace_source": "workload" if args.workload_trace else "synthetic",
+            "context_sweep_ran": ctx_results is not None,
+        },
+    )
 
     print("\nDone.")
 
@@ -620,6 +723,7 @@ def _plot_pd_results(uvp, ratios, transfers, out_dir):
 
 
 def run_cluster(cfg: dict, args) -> None:
+    run_started = time.perf_counter()
     cc = cfg.get("cluster", {})
     ct = cfg.get("cluster_trace", cfg.get("trace", {}))
     ce = cfg.get("cluster_experiments", cfg.get("experiments", {}))
@@ -704,8 +808,17 @@ def run_cluster(cfg: dict, args) -> None:
     # ── 5. Final cluster stats + credibility report ──────────────────
     print(f"\n[5/5] Final Cluster Topology:")
     from sim.cluster import build_cluster
+    from sim.diagnostics import summarize_cluster_health
     cluster = runner.last_cluster or build_cluster(cfg)
     _print_cluster_info(cluster)
+    cluster_health = summarize_cluster_health(cluster)
+    print(
+        "  Active after warmup: "
+        f"{cluster_health['active_gpus']}/{cluster_health['total_gpus']} GPUs, "
+        f"{cluster_health['active_racks']}/{cluster_health['total_racks']} racks"
+    )
+    for message in cluster_health["warnings"]["messages"][:3]:
+        print(f"  [diagnostic] {message}")
     _print_credibility_report(cfg, cluster)
 
     # ── Plot ─────────────────────────────────────────────────────────
@@ -733,6 +846,31 @@ def run_cluster(cfg: dict, args) -> None:
             outputs.append(out3)
         print(f"\nPlots saved → {', '.join(outputs)}")
 
+    report_results = {
+        "eic_sizing": eic_results,
+        "eviction_policies": eviction_results,
+    }
+    if ctx_results is not None:
+        report_results["context_sweep"] = ctx_results
+    _write_reports_if_requested(
+        "cluster",
+        cfg,
+        args,
+        report_results,
+        run_started,
+        {
+            "request_count": len(requests),
+            "warmup_requests": warmup,
+            "trace_source": "workload" if args.workload_trace else "synthetic",
+            "simulated_racks": n_racks,
+            "simulated_gpus_per_rack": n_gpus_per_rack,
+            "simulated_total_gpus": total_sim,
+            "full_cluster_gpus": full_cluster,
+            "context_sweep_ran": ctx_results is not None,
+            "cluster_health": cluster_health,
+        },
+    )
+
     print("\nDone.")
 
 
@@ -744,6 +882,13 @@ def run_cluster(cfg: dict, args) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="KV Cache Multi-Tier Simulator")
     parser.add_argument("--config", default="config.yaml")
+    from sim.presets import PRESET_NAMES
+    parser.add_argument(
+        "--preset",
+        choices=PRESET_NAMES,
+        default=None,
+        help="Apply a run preset: smoke, dev, or prod-eval",
+    )
     parser.add_argument("--cluster", action="store_true", help="Run 万卡 cluster + EIC mode")
     parser.add_argument("--pd", action="store_true", help="Run PD-separated cluster mode")
     parser.add_argument("--no-train", action="store_true")
@@ -765,6 +910,16 @@ def main() -> None:
         "--skip-context-sweep",
         action="store_true",
         help="Skip long context-length sweeps in cluster/PD modes",
+    )
+    parser.add_argument(
+        "--report-json",
+        default=None,
+        help="Write a JSON run report to this path",
+    )
+    parser.add_argument(
+        "--report-csv",
+        default=None,
+        help="Write flattened result metrics as CSV to this path",
     )
     parser.add_argument(
         "--calibration-profile",
@@ -811,23 +966,51 @@ def main() -> None:
         default=None,
         help="Token span represented by each workload hash_id; Mooncake defaults to 512",
     )
+    parser.add_argument(
+        "--strict-workload-validation",
+        action="store_true",
+        help="Fail when a workload trace has validation warnings",
+    )
     args = parser.parse_args()
+    args._calibration_summary = None
+    args._workload_summary = None
+    args._trace_validation = None
 
     cfg = _load_config(args.config)
+    if args.preset:
+        from sim.presets import apply_preset, apply_runtime_defaults
+
+        cfg = apply_preset(cfg, args.preset)
+        apply_runtime_defaults(args, args.preset)
+        if args.show_plot:
+            args.no_plot = False
+        print(f"[preset] Applied {args.preset}")
     if args.calibration_profile:
         from sim.calibration import (
             apply_calibration_profile,
+            assess_calibration_readiness,
             load_calibration_profile,
             profile_name,
         )
 
         profile = load_calibration_profile(args.calibration_profile)
         cfg = apply_calibration_profile(cfg, profile)
+        cal_name = profile_name(profile, args.calibration_profile)
+        overrides = profile.get("overrides", profile)
+        args._calibration_summary = {
+            "path": args.calibration_profile,
+            "name": cal_name,
+            "override_sections": sorted(overrides) if isinstance(overrides, dict) else [],
+            "readiness": assess_calibration_readiness(profile),
+        }
         print(
             f"[calibration] Applied profile "
-            f"{profile_name(profile, args.calibration_profile)} "
+            f"{cal_name} "
             f"({args.calibration_profile})"
         )
+        if args._calibration_summary["readiness"]["warnings"]:
+            for message in args._calibration_summary["readiness"]["warnings"][:3]:
+                print(f"[calibration] {message}")
 
     if args.pd:
         run_pd(cfg, args)
